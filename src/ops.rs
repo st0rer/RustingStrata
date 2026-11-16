@@ -155,12 +155,15 @@ impl Sampler {
         let tail = ch.remainder().iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
         let m = ch.fold([f32::NEG_INFINITY; 16], |mut a, c| { for j in 0..16 { a[j] = a[j].max(c[j]) } a })
             .into_iter().fold(tail, f32::max);
-        let lo = m - 21.0 * self.temp;
-        // Tokens below e^-20 of the best one are dropped first so only a few are sorted, not the whole vocabulary.
+        let lo = m - 20.0 * self.temp;
+        let inv_temp = 1.0 / self.temp;
         let mut c: Vec<(usize, f32)> = logits.iter().enumerate().filter(|x| *x.1 >= lo)
-            .map(|(i, &l)| (i, (l - m) / self.temp)).filter(|x| x.1 > -20.0).map(|(i, x)| (i, x.exp())).collect();
-        c.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        if self.top_k > 0 { c.truncate(self.top_k); }
+            .map(|(i, &l)| (i, ((l - m) * inv_temp).exp())).collect();
+        if self.top_k > 0 && c.len() > self.top_k {
+            c.select_nth_unstable_by(self.top_k, |a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            c.truncate(self.top_k);
+        }
+        c.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         let total: f32 = c.iter().map(|x| x.1).sum();
         let (mut acc, mut n) = (0.0, c.len());
         for (j, x) in c.iter().enumerate() {

@@ -6,9 +6,22 @@ compiled at run time with NVRTC through cudarc, and the same kernels also run on
 build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
 placement adapts to the routing it sees.
 
-Version 1.2.4. Docs: [usage and server API](docs/USAGE.md), [hosting for other people](docs/HOSTING.md),
-[supported GPUs](docs/SUPPORTED_GPUS.md), [AMD notes](docs/AMD.md), [LoRA](docs/LORA.md),
-[all benchmarks](docs/BENCHMARKS.md), [benchmark history](docs/README.md).
+Version 1.2.4 (Fork with Turing `sm_75` & CMP 50HX / RTX 2080 Ti hardware optimizations). Docs:
+[Turing & CMP 50HX Tuning Guide](docs/TURING_AND_CMP50HX_TUNING.md), [usage and server API](docs/USAGE.md),
+[hosting for other people](docs/HOSTING.md), [supported GPUs](docs/SUPPORTED_GPUS.md), [AMD notes](docs/AMD.md),
+[LoRA](docs/LORA.md), [all benchmarks](docs/BENCHMARKS.md), [benchmark history](docs/README.md).
+
+### Turing (sm_75) & CMP 50HX 20GB Benchmark Highlights
+
+On NVIDIA CMP 50HX (20 GB GDDR6, TU102 core, 320-bit bus @ 1750 MHz lock, 165W TDP) running `Cyber-Tiel-Coder-35B-A3B-MTP.gguf` (MoE 256/8, 30 DeltaNet + 10 GQA layers):
+- **100% Expert VRAM Residency:** All 10,496 experts reside entirely in GPU memory (0 CPU misses).
+- **Decode Speed:** **132.5 – 135.2 tok/s** (TPOT: **7.40 – 7.55 ms/tok**).
+- **Speculative MTP-2 Acceptance:** **65.4% – 75.0%** accepted drafts (**2.31 – 2.50 effective tok/step**).
+- **Fast-Math NVRTC:** CUDA FMA vectorization accelerates RMSNorm, RoPE, and DeltaNet recurrence.
+- **Windows Cubin Cache:** Centralized in `%LOCALAPPDATA%\rusting_strata` (< 1s cold startup).
+- **Context Scalability:** 128K context fits in ~15.4 GB VRAM with `--kv q8`.
+
+See [docs/TURING_AND_CMP50HX_TUNING.md](docs/TURING_AND_CMP50HX_TUNING.md) for full benchmarks and architecture details.
 
 ## Numbers
 

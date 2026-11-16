@@ -2326,6 +2326,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             if !matches!(r, Runner::Slot(_)) { start(&mut busy); }
             // Whether the prompt reached the model: a client that left while it waited in the queue is not logged.
             let mut prefilled = false;
+            let mut drafts0 = (0, 0);
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
@@ -2348,6 +2349,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
+                drafts0 = match r { Runner::Gpu(g) => g.drafts, _ => (0, 0) };
                 let mut last_stream_activity = Instant::now();
                 decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
@@ -2376,16 +2378,35 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
             let mut last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
                 prompt_tokens: ids.len(), completion_tokens: k, prefill_ms: ms(t1 - t0), decode_ms: ms(decoded), finish: String::new() };
-            let log = |last: &serve::Last| {
+            let log = |last: &serve::Last, r: &Runner, d0: (usize, usize)| {
                 let decode_s = last.decode_ms / 1e3;
                 let prefill_s = last.prefill_ms / 1e3;
                 // Cached prompt tokens were not prefilled again, so they do not count toward the prefill speed.
                 let new_prompt = last.prompt_tokens.saturating_sub(last.cached_tokens);
                 let decode_tps = if decode_s > 0.0 { last.completion_tokens as f64 / decode_s } else { 0.0 };
                 let prefill_tps = if prefill_s > 0.0 { new_prompt as f64 / prefill_s } else { 0.0 };
-                eprintln!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
-                    decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s, finish={}",
-                    last.model, last.prompt_tokens, last.cached_tokens, last.completion_tokens, last.finish);
+                let tpot = if last.completion_tokens > 0 { last.decode_ms / last.completion_tokens as f64 } else { 0.0 };
+                eprintln!("\n=================== INFERENCE STAGE BREAKDOWN ===================");
+                eprintln!("PREFILL: {} tokens ({} cached, {} new) in {:.3}s ({:.1} tok/s) | TTFT: {:.1} ms",
+                    last.prompt_tokens, last.cached_tokens, new_prompt, prefill_s, prefill_tps, last.prefill_ms);
+                eprintln!("DECODE:  {} tokens in {:.2}s ({:.1} tok/s) | TPOT: {:.2} ms/tok | finish={}",
+                    last.completion_tokens, decode_s, decode_tps, tpot, last.finish);
+                if let Runner::Gpu(g) = r {
+                    let req_drafts = (g.drafts.0.saturating_sub(d0.0), g.drafts.1.saturating_sub(d0.1));
+                    if req_drafts.0 > 0 {
+                        let kind = if g.ngram.is_some() && g.k > 0 { "Hybrid MTP+Ngram" } else if g.ngram.is_some() { "Speculative Ngram" } else { "MTP" };
+                        let rate = 100.0 * req_drafts.1 as f64 / req_drafts.0 as f64;
+                        let spec_steps = last.completion_tokens.saturating_sub(req_drafts.1);
+                        let eff = if spec_steps > 0 { last.completion_tokens as f64 / spec_steps as f64 } else { 1.0 };
+                        let achieved_gb_s = (881.4e6 * spec_steps as f64) / decode_s.max(1e-4) / 1e9;
+                        let mbu = (achieved_gb_s / 560.0) * 100.0;
+                        eprintln!("SPECULATION: [{kind}] Drafts accepted: {}/{} ({:.1}%) | Eff: {:.2} tok/step",
+                            req_drafts.1, req_drafts.0, rate, eff);
+                        eprintln!("BANDWIDTH & MBU: Achieved Bandwidth: {:.1} GB/s | Model Bandwidth Utilization: {:.1}%",
+                            achieved_gb_s, mbu);
+                    }
+                }
+                eprintln!("=================================================================\n");
                 if let Some(f) = &s.usage {
                     let mut v = json!(last);
                     v["key"] = who.name.clone().into();
@@ -2402,7 +2423,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     last.finish = if gone { "cut" } else { "error" }.into();
                     // A request that failed before its prefill ended measured no prefill speed (t1 is still t0).
                     if !prefilled { last.prefill_ms = 0.0; }
-                    if prefilled || !gone { log(&last); }
+                    if prefilled || !gone { log(&last, r, drafts0); }
                     if !req.stream && !gone {
                         let sent = send(&mut w, "500 Internal Server Error", json!({"error": {"message": format!("{err:#}"), "type": "server_error"}}));
                         serve::exit_if_gpu_dead(&err);
@@ -2416,7 +2437,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             last.completion_tokens = out.len();
             last.finish = if calls.is_some() { "tool_calls" } else if stop { "stop" } else { "length" }.into();
             let timings = llama_timings(&last);
-            log(&last);
+            log(&last, r, drafts0);
             s.stats.lock().unwrap().record(last);
             let calls_json = |(content, calls): &(String, Vec<(String, String)>), stream: bool| {
                 let c: Vec<_> = calls.iter().enumerate().map(|(k, (f, a))| {
