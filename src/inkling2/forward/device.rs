@@ -1116,24 +1116,25 @@ impl Device {
                 if !ml.swa {
                     be.ink_clip_n(p.k2, 0, hd, nkv, nt, c.qk_clip, 0.0, 1.0, ds.k.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
                     be.ink_clip_n(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, ds.v.addr(), pos0, ds.cap, 0, 0.0, 1.0)?;
-                }
-                for t in 0..nt {
-                    let pos = pos0 + t;
-                    let (rows, at) = if ml.swa {
+                    be.ink_attn_prefill(
+                        p.q, p.r, p.sink, p.og, ds.k.addr(), ds.v.addr(), 0, 0, l.rel_bias.addr(), p.att,
+                        pos0, nt, nh, nkv, hd, nr, c.rel_extent, ds.cap, 0
+                    )?;
+                } else {
+                    for t in 0..nt {
+                        let pos = pos0 + t;
                         let at = pos % c.n_swa;
                         be.dtod(&ds.k, at * rb, &pf.swa_kc_log, swa_base + t * rb, rb)?;
                         be.dtod(&ds.v, at * rb, &pf.swa_vc_log, swa_base + t * rb, rb)?;
                         be.ink_clip_n(p.k2 + f(t * kw), 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
                         be.ink_clip_n(p.v2 + f(t * kw), 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
-                        ((pos + 1).min(c.n_swa), at)
-                    } else {
-                        (pos + 1, pos)
-                    };
-                    be.ink_attn(
-                        p.q + f(t * nh * hd), p.r + f(t * nh * nr), p.sink + f(t * nh), p.og + f(t * nh * hd),
-                        ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), p.att + f(t * nh * hd),
-                        rows, at, nh, nkv, hd, nr, c.rel_extent,
-                    )?;
+                        let rows = (pos + 1).min(c.n_swa);
+                        be.ink_attn(
+                            p.q + f(t * nh * hd), p.r + f(t * nh * nr), p.sink + f(t * nh), p.og + f(t * nh * hd),
+                            ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), p.att + f(t * nh * hd),
+                            rows, at, nh, nkv, hd, nr, c.rel_extent,
+                        )?;
+                    }
                 }
             } else {
                 let (kd, vd, at0, kvr) = if ml.swa {

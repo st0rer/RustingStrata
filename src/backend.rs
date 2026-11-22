@@ -411,7 +411,7 @@ pub trait Backend: Send {
     fn dspark_attn(&self, _q: u64, _kc: u64, _vc: u64, _k_blk: u64, _v_blk: u64, _out: u64, _first: usize, _n_ctx: usize, _ring: usize, _bs: usize, _nh: usize, _nkv: usize, _hd: usize, _scale: f32) -> anyhow::Result<()> {
         anyhow::bail!("{}: DSpark GPU not implemented", self.name())
     }
-    fn dspark_markov_prep(&self, _prev_tok: u32, _markov_w1: u64, _state: u64, _h_row: u64, _ctx_feat: u64, _joint_in: u64, _n: usize, _rank: usize) -> anyhow::Result<()> {
+    fn dspark_markov_prep(&self, _prev_tok_ptr: u64, _markov_w1: u64, _state: u64, _h_row: u64, _ctx_feat: u64, _joint_in: u64, _n: usize, _rank: usize) -> anyhow::Result<()> {
         anyhow::bail!("{}: DSpark GPU not implemented", self.name())
     }
     fn dspark_markov_step(&self, _joint: u64, _joint_bias: u64, _state: u64, _latent: u64, _rank: usize) -> anyhow::Result<()> {

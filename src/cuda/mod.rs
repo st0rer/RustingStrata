@@ -1227,8 +1227,8 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn dspark_markov_prep(&self, prev_tok: u32, markov_w1: u64, state: u64, h_row: u64, ctx_feat: u64, joint_in: u64, n: usize, rank: usize) -> anyhow::Result<()> {
-        launch!(self, "dspark_markov_prep", cfg((1, 1), 256, 0), prev_tok as i32, markov_w1, state, h_row, ctx_feat, joint_in, n as i32, rank as i32);
+    fn dspark_markov_prep(&self, prev_tok_ptr: u64, markov_w1: u64, state: u64, h_row: u64, ctx_feat: u64, joint_in: u64, n: usize, rank: usize) -> anyhow::Result<()> {
+        launch!(self, "dspark_markov_prep", cfg((1, 1), 256, 0), prev_tok_ptr, markov_w1, state, h_row, ctx_feat, joint_in, n as i32, rank as i32);
         Ok(())
     }
 

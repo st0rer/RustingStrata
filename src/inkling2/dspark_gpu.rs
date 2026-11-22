@@ -200,7 +200,7 @@ impl GpuDspark {
         let scr_state = be.alloc(4 * rank)?;
         let scr_latent = be.alloc(4 * rank)?;
         let scr_corr = be.alloc(4 * n_embd)?;
-        let scr_out_tok = be.alloc(4)?;
+        let scr_out_tok = be.alloc(4 * (block_size + 1))?;
         let scr_anchor_emb = be.alloc(4 * n_embd)?;
 
         let max_inj_chunk = 64;
@@ -423,17 +423,20 @@ impl GpuDspark {
         // 3. Output RMS norm -> scr_hidden
         be.rms_norm(self.scr_inp.addr(), n, self.output_norm.addr(), self.scr_hidden.addr(), n, n, bs, eps)?;
 
-        // 4. Chained Markov RNN Head
+        // 4. Chained Markov RNN Head (100% Async on GPU, zero PCIe host round trips per step)
         be.memset(&self.scr_state)?;
-        let mut prev = anchor_tok;
-        let mut drafts = Vec::with_capacity(count);
+        let anchor_bytes = anchor_tok.to_le_bytes();
+        be.put(&anchor_bytes, &self.scr_out_tok, 0)?;
+
         let rank = self.rank;
 
         for step in 0..count {
             let h_row_addr = self.scr_hidden.addr() + 4 * ((step + 1) * n) as u64;
+            let prev_tok_ptr = self.scr_out_tok.addr() + 4 * step as u64;
+            let next_tok_ptr = self.scr_out_tok.addr() + 4 * (step + 1) as u64;
 
             be.dspark_markov_prep(
-                prev,
+                prev_tok_ptr,
                 self.markov_w1.addr(),
                 self.scr_state.addr(),
                 h_row_addr,
@@ -460,13 +463,16 @@ impl GpuDspark {
             if softcap != 0.0 {
                 be.softcap(s_logits, n_vocab, softcap)?;
             }
-            be.argmax_rows(s_logits, n_vocab, 1, self.scr_out_tok.addr())?;
-
-            let mut tok_bytes = [0u8; 4];
-            be.dtoh(&self.scr_out_tok, 0, &mut tok_bytes)?;
-            prev = u32::from_le_bytes(tok_bytes);
-            drafts.push(prev);
+            be.argmax_rows(s_logits, n_vocab, 1, next_tok_ptr)?;
         }
+
+        // Single contiguous DtoH copy of all generated draft tokens at the end
+        let mut drafts_bytes = vec![0u8; count * 4];
+        be.dtoh(&self.scr_out_tok, 4, &mut drafts_bytes)?;
+        let drafts: Vec<u32> = drafts_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
 
         Ok(drafts)
     }

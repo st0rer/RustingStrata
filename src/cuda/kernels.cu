@@ -3834,7 +3834,7 @@ extern "C" __global__ void dspark_attn(
 }
 
 extern "C" __global__ void dspark_markov_prep(
-    int prev_tok,
+    const int* prev_tok_ptr,
     const u16* markov_w1,   // [201024, rank] BF16
     const float* state,     // [rank]
     const float* h_row,     // [n]
@@ -3843,6 +3843,7 @@ extern "C" __global__ void dspark_markov_prep(
     int n,                  // 2304
     int rank                // 256
 ) {
+    int prev_tok = *prev_tok_ptr;
     int k = threadIdx.x;
     if (k < rank) {
         joint_in[k] = state[k];
