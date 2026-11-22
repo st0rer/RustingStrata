@@ -1273,7 +1273,8 @@ impl<'a> Inkling2Model<'a> {
                 let target_end = self.toks.len() + seq.len() - 1;
                 match d.prepare(self, target_end) {
                     Ok(()) => {
-                        let chunk = env_chunk.unwrap_or(2048).clamp(1, 4096);
+                        let req_chunk = env_chunk.unwrap_or(2048).clamp(1, 65536);
+                        let chunk = d.ensure_pf_chunk(self, req_chunk, seq.len());
                         let mut logits = vec![];
                         let mut done = 0usize;
                         let mut failed = None;
@@ -1317,7 +1318,7 @@ impl<'a> Inkling2Model<'a> {
                 }
             }
         }
-        let mut chunk = env_chunk.unwrap_or(2048);
+        let mut chunk = env_chunk.unwrap_or(2048).clamp(1, 65536);
         if dump_or_trace { chunk = 1; }
         let mut logits = vec![];
         for (i, c) in seq.chunks(chunk.max(1)).enumerate() { logits = self.run_seq(c, (i + 1) * chunk.max(1) >= seq.len()); }

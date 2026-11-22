@@ -701,13 +701,14 @@ impl Device {
             be.sync()?;
             self.pf = None;
         }
-        let target = need_nt.max(256).min(4096);
+        let target = need_nt.max(256).min(65536);
         let mut tries = vec![target];
         if need_nt < target {
-            if target > 2048 { tries.push(need_nt.max(2048)); }
-            if target > 1024 { tries.push(need_nt.max(1024)); }
-            if target > 512 { tries.push(need_nt.max(512)); }
-            if target > 256 { tries.push(need_nt.max(256)); }
+            for &step in &[32768, 16384, 8192, 4096, 2048, 1024, 512, 256] {
+                if target > step && need_nt <= step {
+                    tries.push(step);
+                }
+            }
             tries.push(need_nt.max(128));
             tries.push(need_nt.max(64));
             tries.push(need_nt);
@@ -720,6 +721,28 @@ impl Device {
             }
         }
         Err(last_err.unwrap())
+    }
+
+    /// Determine and pre-allocate the largest GPU prefill scratch capacity that fits in VRAM,
+    /// up to `want_chunk` (clamped to `seq_len`). Falls back gracefully down to 256.
+    pub(super) fn ensure_pf_chunk(&mut self, m: &Inkling2Model, want_chunk: usize, seq_len: usize) -> usize {
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let c = &m.cfg;
+        let vocab_rows = m.output.rows;
+        let target = want_chunk.min(seq_len).max(256).min(65536);
+        let mut test_caps = vec![target];
+        for &step in &[65536, 32768, 16384, 8192, 4096, 2048, 1024, 512, 256] {
+            if step < target && !test_caps.contains(&step) {
+                test_caps.push(step);
+            }
+        }
+        for cap in test_caps {
+            if self.ensure_pf(be, c, vocab_rows, cap).is_ok() {
+                return cap;
+            }
+        }
+        256
     }
 
     /// Project a single corrected hidden vector `h_corr` (`[n_embd]`) through the target's LM head on GPU,
