@@ -27,9 +27,11 @@ base64 = "0.22"
 
 [profile.release]
 opt-level = 3
-debug = 1
+debug = 0
 codegen-units = 1
-lto = "thin"
+lto = "fat"
+panic = "abort"
+strip = true
 
 [profile.test]
 opt-level = 3
