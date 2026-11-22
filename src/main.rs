@@ -354,6 +354,9 @@ impl Engine {
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
     fn ds_env(&self) {
         // SAFETY: called at the start of a command, before any thread reads these variables.
+        if self.gpu && std::env::var_os("STRATA_DS_GPU").is_none() {
+            unsafe { std::env::set_var("STRATA_DS_GPU", "1"); }
+        }
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // Hy4: every expert on the GPU
@@ -2740,7 +2743,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
             _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
-                max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
+                max_ctx: engine.ctx, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
                 mmproj, draft_model: engine.draft_model.clone(), ngram_cfg: engine.ngram_config()? })?,
         })
     } else {
@@ -2789,6 +2792,7 @@ struct OwnState(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
 impl OwnState {
     fn new() -> OwnState {
+        rusting_strata::deepseek::mat::dev_free();
         OwnState(["STRATA_DS_GPU", "STRATA_DS_GPU_FRACTION", "STRATA_DS_GPU_EXPERTS", "STRATA_DS_NOEVICT", "STRATA_GLM_PREFETCH"].map(|k| (k, std::env::var_os(k))).into())
     }
 }
