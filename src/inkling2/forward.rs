@@ -115,6 +115,7 @@ pub struct Inkling2Model<'a> {
     pub spec_draft_max: usize,
     /// Speculative decoding stats: `(drafts_proposed, drafts_accepted)`.
     pub drafts: (usize, usize),
+    emb_scratch: std::cell::RefCell<Vec<f32>>,
 }
 
 /// A token of `device` counts all the device work before the router as "mix": the queue runs while the host waits
@@ -541,6 +542,7 @@ impl<'a> Inkling2Model<'a> {
             dspark: None,
             spec_draft_max: 3,
             drafts: (0, 0),
+            emb_scratch: std::cell::RefCell::new(vec![0.0f32; cfg.n_embd]),
             cfg,
         };
         if !m.trace && std::env::var_os("STRATA_DS_DUMP").is_none() {
@@ -1050,6 +1052,37 @@ impl<'a> Inkling2Model<'a> {
         self.host_verify_forward(cand, capture_dspark)
     }
 
+    fn verify_batch_argmax(&mut self, cand: &[u32], capture_dspark: bool) -> (Vec<u32>, Option<Vec<f32>>) {
+        let pos0 = self.toks.len();
+        if self.device.is_none() && !self.no_device {
+            self.device = device::Device::new(self).map(Box::new);
+            self.no_device = self.device.is_none();
+        }
+        if let Some(mut d) = self.device.take() {
+            match d.prepare(self, pos0 + cand.len() - 1) {
+                Ok(()) => match d.verify_forward_argmax(self, cand, capture_dspark) {
+                    Ok(res) => {
+                        self.device = Some(d);
+                        return res;
+                    }
+                    Err(e) => {
+                        eprintln!("inkling2: GPU verify failed ({e:#}); falling back to host");
+                        d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
+                        self.no_device = true;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("inkling2: no room in VRAM for verify ({e:#}); falling back to host");
+                    d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
+                    self.no_device = true;
+                }
+            }
+        }
+        let (logits, feats) = self.host_verify_forward(cand, capture_dspark);
+        let toks = logits.into_iter().map(|l| crate::ops::argmax(&l) as u32).collect();
+        (toks, feats)
+    }
+
     fn commit_batch(&mut self, pos0: usize, keep: usize, nt: usize, cand: &[u32], feats: Option<&[f32]>) {
         if let Some(mut d) = self.device.take() {
             d.commit_verify(self, pos0, keep, nt).expect("inkling2 commit_verify");
@@ -1076,7 +1109,7 @@ impl<'a> Inkling2Model<'a> {
         if draft.is_empty() && cap_ds > 0 && self.dspark.is_some() {
             let pos0 = self.toks.len();
             if self.device.as_ref().is_some_and(|d| d.dspark_gpu.is_some()) && self.output.gpu.is_some() {
-                let mut emb = vec![0.0f32; self.cfg.n_embd];
+                let mut emb = self.emb_scratch.borrow_mut();
                 self.embed_normed(anchor_tok, &mut emb);
                 let (output_gpu, n_vocab, softcap) = (self.output.gpu.unwrap(), self.cfg.n_vocab, self.cfg.softcap);
                 if let Some(d) = &mut self.device {
@@ -1107,16 +1140,16 @@ impl<'a> Inkling2Model<'a> {
         let mut cand = Vec::with_capacity(1 + draft.len());
         cand.push(anchor_tok);
         cand.extend_from_slice(&draft);
-        let (logits, feats) = self.verify_batch(&cand, self.dspark.is_some());
+        let (argmax_toks, feats) = self.verify_batch_argmax(&cand, self.dspark.is_some());
         // The host fallback verifies the anchor only.
-        cand.truncate(logits.len());
+        cand.truncate(argmax_toks.len());
         let (draft, nt) = (&draft[..cand.len() - 1], cand.len());
         let mut out = Vec::with_capacity(nt);
         let mut accepted = 0usize;
         let mut hit_eos = false;
         let mut bonus = None;
         for (j, &d_tok) in draft.iter().enumerate() {
-            let want = crate::ops::argmax(&logits[j]) as u32;
+            let want = argmax_toks[j];
             if want == d_tok {
                 accepted += 1;
                 out.push(d_tok);
@@ -1130,7 +1163,7 @@ impl<'a> Inkling2Model<'a> {
             }
         }
         if !hit_eos {
-            let b = bonus.unwrap_or_else(|| crate::ops::argmax(&logits[accepted]) as u32);
+            let b = bonus.unwrap_or(argmax_toks[accepted]);
             out.push(b);
         }
         let keep = 1 + accepted;

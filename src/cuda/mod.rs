@@ -593,18 +593,25 @@ impl Gpu {
         let sm = tiles == 0 && (grid.0 * grid.1 < 112 || nd <= 32);
         let grid = if sm { (grid.0, nd.div_ceil(32) as u32) } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);
-        let mut q8 = self.q8.lock().unwrap();
-        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
-        let reuse = same && q8.1 == key;
-        // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
-        // A gemm inside a batch cannot quantize x (the quantize and the gemm would land on different streams): when
-        // the cached q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel. Volta and Turing have no int8 tensor-core mma: there the
-        // kernels are not loaded (`i8_gemm`), so this gate must dominate `STRATA_MMQ`; they take the f16 gemm_*/gemms_*.
-        let int8 = self.i8_gemm && self.int8_mma && Self::mmq(ty) && cols.is_multiple_of(128);
         let only_small = act & GEMM_ONLY_SMALL != 0;
         let only_large = act & GEMM_ONLY_LARGE != 0;
         let act_mode = act & 3;
-        if !int8 || (!reuse && self.nb.load(Relaxed) < BESIDE) {
+        let int8 = self.i8_gemm && self.int8_mma && Self::mmq(ty) && cols.is_multiple_of(128);
+        if !int8 {
+            if !only_small {
+                launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                    tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act_mode, w_scale);
+            }
+            if tiles != 0 && !only_large {
+                launch!(self, &kname("gemms", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                    tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act_mode, w_scale);
+            }
+            return Ok(());
+        }
+        let mut q8 = self.q8.lock().unwrap();
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
+        let reuse = same && q8.1 == key;
+        if !reuse && self.nb.load(Relaxed) < BESIDE {
             if !same { q8.1 = None; }
             if !only_small {
                 launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),

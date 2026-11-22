@@ -902,6 +902,27 @@ impl Device {
         toks: &[u32],
         capture_dspark: bool,
     ) -> Result<(Vec<Vec<f32>>, Option<Vec<f32>>)> {
+        let (logits, _, feats) = self.verify_forward_mode(m, toks, capture_dspark, false)?;
+        Ok((logits, feats))
+    }
+
+    pub(super) fn verify_forward_argmax(
+        &mut self,
+        m: &Inkling2Model,
+        toks: &[u32],
+        capture_dspark: bool,
+    ) -> Result<(Vec<u32>, Option<Vec<f32>>)> {
+        let (_, argmax_toks, feats) = self.verify_forward_mode(m, toks, capture_dspark, true)?;
+        Ok((argmax_toks, feats))
+    }
+
+    fn verify_forward_mode(
+        &mut self,
+        m: &Inkling2Model,
+        toks: &[u32],
+        capture_dspark: bool,
+        argmax_only: bool,
+    ) -> Result<(Vec<Vec<f32>>, Vec<u32>, Option<Vec<f32>>)> {
         let (c, pos0, nt) = (&m.cfg, m.toks.len(), toks.len());
         ensure!(nt > 0 && nt <= VERIFY_MAX && pos0 + nt <= m.max_ctx, "verify_forward: invalid range {pos0} + {nt}");
         let (n, core) = (c.n_embd, c.loop_end - c.loop_start);
@@ -974,7 +995,7 @@ impl Device {
             visit += 1;
             self.prefill_layer(m, il, il, false, pos0, nt, true, &mut nb, &mut cur_a, &mut x_a)?;
         }
-        let (logits_all, dspark_feats) = {
+        let (logits_all, argmax_all, dspark_feats) = {
             let t = std::time::Instant::now();
             let d = dev::get().unwrap().lock().unwrap();
             let be = &*d.parts[0].be;
@@ -1003,13 +1024,22 @@ impl Device {
             } else {
                 None
             };
-            let raw: Vec<f32> = be.get(&pf.logits_buf, 0, nt * vrows)?;
-            let logits: Vec<Vec<f32>> = (0..nt).map(|i| raw[i * vrows..i * vrows + c.n_vocab].to_vec()).collect();
+            let (logits, argmax_toks) = if argmax_only {
+                let (s, scr_o) = (self.s, self.scr.addr());
+                be.argmax_rows(pf.logits_buf.addr(), vrows, nt, s.amax)?;
+                let toks_i32: Vec<i32> = be.get(&self.scr, ((s.amax - scr_o) / 4) as usize, nt)?;
+                let toks: Vec<u32> = toks_i32.into_iter().map(|id| (id as u32).min((c.n_vocab - 1) as u32)).collect();
+                (Vec::new(), toks)
+            } else {
+                let raw: Vec<f32> = be.get(&pf.logits_buf, 0, nt * vrows)?;
+                let log: Vec<Vec<f32>> = (0..nt).map(|i| raw[i * vrows..i * vrows + c.n_vocab].to_vec()).collect();
+                (log, Vec::new())
+            };
             m.lap(7, t);
-            (logits, dspark)
+            (logits, argmax_toks, dspark)
         };
         m.report(pos0, nt, t0);
-        Ok((logits_all, dspark_feats))
+        Ok((logits_all, argmax_all, dspark_feats))
     }
 
     /// Commit the first `keep` (`1 <= keep <= nt`) tokens of a `verify_forward` pass on the GPU in place.
@@ -1256,25 +1286,27 @@ impl Device {
                     let ids: Vec<i32> = be.get(&pf.buf, ((p.ids - buf_o) / 4) as usize, nt * k)?;
                     let np = nt * k;
 
-                    // 1. Counting sort: 0 nested Vec allocations (was 128 heap allocations every layer)
-                    let mut e_cnt = vec![0u32; c.n_expert];
+                    // 1. Counting sort: 0 heap allocations for counting bins + 4-byte packed sorted_idx
+                    let mut e_cnt = [0u32; 256];
                     for &e in &ids {
                         if (e as usize) < c.n_expert {
                             e_cnt[e as usize] += 1;
                         }
                     }
-                    let mut e_head = vec![0u32; c.n_expert];
+                    let mut e_head = [0u32; 256];
                     let mut sum = 0u32;
                     for e in 0..c.n_expert {
                         e_head[e] = sum;
                         sum += e_cnt[e];
                     }
-                    let mut e_cur = e_head.clone();
-                    let mut sorted_tj = vec![(0u32, 0u8); np];
+                    let mut e_cur = e_head;
+                    let mut sorted_idx = Vec::with_capacity(np);
+                    unsafe { sorted_idx.set_len(np); }
                     for (t, row) in ids.chunks_exact(k).enumerate() {
+                        let t_base = (t * k) as u32;
                         for (j, &e) in row.iter().enumerate() {
                             let slot = &mut e_cur[e as usize];
-                            sorted_tj[*slot as usize] = (t as u32, j as u8);
+                            sorted_idx[*slot as usize] = t_base + j as u32;
                             *slot += 1;
                         }
                     }
@@ -1282,7 +1314,8 @@ impl Device {
                     let mut tiles_gu: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
                     let mut tiles_dn: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
                     let mut xrow: Vec<i32> = Vec::with_capacity(np);
-                    let mut inv: Vec<i32> = vec![0i32; np];
+                    let mut inv: Vec<i32> = Vec::with_capacity(np);
+                    unsafe { inv.set_len(np); }
                     let mut gsc_rows: Vec<f32> = if ml.gu_scale.is_empty() { Vec::new() } else { Vec::with_capacity(np) };
                     let mut m0 = 0usize;
                     let mut has_small = false;
@@ -1299,9 +1332,10 @@ impl Device {
                             tiles_dn.extend([wd, (m0 + at) as u64 | (cnt << 32)]);
                         }
                         let start = e_head[e] as usize;
-                        for &(t, j) in &sorted_tj[start..start + cnt_e] {
-                            inv[(t as usize) * k + (j as usize)] = xrow.len() as i32;
-                            xrow.push(t as i32);
+                        for &idx in &sorted_idx[start..start + cnt_e] {
+                            let t = (idx / k as u32) as i32;
+                            inv[idx as usize] = xrow.len() as i32;
+                            xrow.push(t);
                             if !ml.gu_scale.is_empty() { gsc_rows.push(ml.gu_scale[e]); }
                         }
                         m0 += cnt_e;
@@ -1313,9 +1347,10 @@ impl Device {
                     let total_meta_bytes = inv_off + 4 * np;
                     ensure!(total_meta_bytes <= pf.meta.len(), "prefill meta overflow");
 
-                    // 2. Coalesce all 4 metadata arrays into a single HtoD copy (was 4 separate cudaMemcpy calls per layer)
-                    let mut meta_bytes = vec![0u8; total_meta_bytes];
+                    // 2. Coalesce all 4 metadata arrays into a single HtoD copy (uninitialized allocation avoided)
+                    let mut meta_bytes = Vec::with_capacity(total_meta_bytes);
                     unsafe {
+                        meta_bytes.set_len(total_meta_bytes);
                         let ptr = meta_bytes.as_mut_ptr();
                         std::ptr::copy_nonoverlapping(tiles_gu.as_ptr() as *const u8, ptr, 8 * tiles_gu.len());
                         std::ptr::copy_nonoverlapping(tiles_dn.as_ptr() as *const u8, ptr.add(dn_off), 8 * tiles_dn.len());
