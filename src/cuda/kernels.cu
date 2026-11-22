@@ -3846,7 +3846,7 @@ extern "C" __global__ void dspark_markov_prep(
     int k = threadIdx.x;
     if (k < rank) {
         joint_in[k] = state[k];
-        u16 w = markov_w1[(size_t)prev_tok * rank + k];
+        u16 w = (prev_tok >= 0 && prev_tok < 201024) ? markov_w1[(size_t)prev_tok * rank + k] : 0;
         joint_in[rank + k] = __uint_as_float((u32)w << 16);
     }
     for (int j = k; j < n; j += blockDim.x) {
