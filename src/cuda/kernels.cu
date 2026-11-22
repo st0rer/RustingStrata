@@ -3665,3 +3665,242 @@ extern "C" __global__ void __launch_bounds__(1024) qsa_select(const float* score
         if (tid == 0) sel[0] = 4 * top + pos + 1 - 4 * nb;
     }
 }
+
+// ---- Inkling 2 DSpark GPU speculative drafting kernels ----
+
+extern "C" __global__ void dspark_init_inp(
+    const float* anchor_emb,
+    const float* mask_emb,
+    float* inp,
+    int n,
+    int bs
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        inp[i] = anchor_emb[i];
+        for (int b = 1; b < bs; b++) {
+            inp[(size_t)b * n + i] = mask_emb[i];
+        }
+    }
+}
+
+extern "C" __global__ void dspark_mix_norm(
+    const float* feats,      // [4, stride_nt, n]
+    const float* fuse_w,     // [4] (softmax normalized weights)
+    const float* norm_w,     // [n]
+    float* out,              // [keep, n]
+    int keep,
+    int stride_nt,
+    int n,
+    float eps
+) {
+    int t = blockIdx.x;
+    if (t >= keep) return;
+
+    float w0 = fuse_w[0], w1 = fuse_w[1], w2 = fuse_w[2], w3 = fuse_w[3];
+    const float* s0 = feats + ((size_t)0 * stride_nt + t) * n;
+    const float* s1 = feats + ((size_t)1 * stride_nt + t) * n;
+    const float* s2 = feats + ((size_t)2 * stride_nt + t) * n;
+    const float* s3 = feats + ((size_t)3 * stride_nt + t) * n;
+
+    float sum_sq = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        float val = w0 * s0[j] + w1 * s1[j] + w2 * s2[j] + w3 * s3[j];
+        sum_sq += val * val;
+    }
+    sum_sq = block_sum(sum_sq);
+    float rms = rsqrtf(sum_sq / (float)n + eps);
+
+    float* dst = out + (size_t)t * n;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        float val = w0 * s0[j] + w1 * s1[j] + w2 * s2[j] + w3 * s3[j];
+        dst[j] = val * rms * norm_w[j];
+    }
+}
+
+extern "C" __global__ void dspark_norm_rope(
+    float* x,              // [nt, nh, hd]
+    const float* norm_w,   // [hd]
+    float* out,            // [nt, nh, hd]
+    int hd,                // 128
+    int nh,                // 24 (Q) or 8 (K)
+    int pos0,
+    int nt,                // tokens
+    float eps,
+    float theta
+) {
+    int h = blockIdx.x;    // head 0..nh-1
+    int t = blockIdx.y;    // token 0..nt-1
+    int d = threadIdx.x;   // dimension 0..127
+    if (h >= nh || t >= nt || d >= hd) return;
+
+    int pos = pos0 + t;
+    size_t off = ((size_t)t * nh + h) * hd;
+    float v = x[off + d];
+
+    float v_sq = v * v;
+    float sum_sq = block_sum(v_sq);
+    float rms = rsqrtf(sum_sq / (float)hd + eps);
+    float v_norm = v * rms * norm_w[d];
+
+    __shared__ float sh_v[128];
+    sh_v[d] = v_norm;
+    __syncthreads();
+
+    int half = hd / 2; // 64
+    if (d < half) {
+        float freq = powf(theta, -((float)(2 * d) / (float)hd));
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        float x0 = sh_v[d];
+        float x1 = sh_v[d + half];
+        out[off + d] = x0 * cos_a - x1 * sin_a;
+        out[off + d + half] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+extern "C" __global__ void dspark_attn(
+    const float* q,        // [bs, nh, hd]
+    const float* kc,       // [ring, nkv, hd]
+    const float* vc,       // [ring, nkv, hd]
+    const float* k_blk,    // [bs, nkv, hd]
+    const float* v_blk,    // [bs, nkv, hd]
+    float* out,            // [bs, nh, hd]
+    int first,
+    int n_ctx,
+    int ring,
+    int bs,
+    int nh,
+    int nkv,
+    int hd,
+    float scale
+) {
+    int h = blockIdx.x;      // head 0..nh-1
+    int i = blockIdx.y;      // query token 0..bs-1
+    int d = threadIdx.x;     // dimension 0..127
+    if (h >= nh || i >= bs || d >= hd) return;
+
+    int group = nh / nkv;
+    int kh = h / group;
+    int kw = nkv * hd;
+
+    float q_val = q[((size_t)i * nh + h) * hd + d];
+
+    __shared__ float s_red[32];
+    int lane = d & 31;
+    int warp = d >> 5;
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    int n_tot = n_ctx + bs;
+    for (int s = 0; s < n_tot; s++) {
+        float k_val, v_val;
+        if (s < n_ctx) {
+            int slot = (first + s) % ring;
+            k_val = kc[(size_t)slot * kw + kh * hd + d];
+            v_val = vc[(size_t)slot * kw + kh * hd + d];
+        } else {
+            int b = s - n_ctx;
+            k_val = k_blk[(size_t)b * kw + kh * hd + d];
+            v_val = v_blk[(size_t)b * kw + kh * hd + d];
+        }
+
+        float prod = q_val * k_val;
+        prod = warp_sum(prod);
+        if (lane == 0) s_red[warp] = prod;
+        __syncthreads();
+
+        if (d == 0) {
+            float total = s_red[0] + s_red[1] + s_red[2] + s_red[3];
+            s_red[0] = total * scale;
+        }
+        __syncthreads();
+        float score = s_red[0];
+
+        // Online softmax update
+        float m_new = fmaxf(m, score);
+        float p = expf(score - m_new);
+        float factor = expf(m - m_new);
+        l = l * factor + p;
+        acc = acc * factor + p * v_val;
+        m = m_new;
+        __syncthreads();
+    }
+
+    out[((size_t)i * nh + h) * hd + d] = acc / (l + 1e-10f);
+}
+
+extern "C" __global__ void dspark_markov_prep(
+    int prev_tok,
+    const u16* markov_w1,   // [201024, rank] BF16
+    const float* state,     // [rank]
+    const float* h_row,     // [n]
+    const float* ctx_feat,  // [n]
+    float* joint_in,        // [2 * rank + 2 * n] = [5120]
+    int n,                  // 2304
+    int rank                // 256
+) {
+    int k = threadIdx.x;
+    if (k < rank) {
+        joint_in[k] = state[k];
+        u16 w = markov_w1[(size_t)prev_tok * rank + k];
+        joint_in[rank + k] = __uint_as_float((u32)w << 16);
+    }
+    for (int j = k; j < n; j += blockDim.x) {
+        joint_in[2 * rank + j] = h_row[j];
+        joint_in[2 * rank + n + j] = ctx_feat[j];
+    }
+}
+
+extern "C" __global__ void dspark_markov_step(
+    const float* joint,       // [3 * rank] = [768]
+    const float* joint_bias,  // [3 * rank] = [768]
+    float* state,             // [rank]
+    float* latent,            // [rank]
+    int rank                  // 256
+) {
+    int k = threadIdx.x;
+    if (k < rank) {
+        float j0 = joint[k] + joint_bias[k];
+        float j1 = joint[rank + k] + joint_bias[rank + k];
+        float j2 = joint[2 * rank + k] + joint_bias[2 * rank + k];
+        float gate = sigmoid(j0);
+        float cand = tanhf(j1);
+        state[k] = cand + gate * (state[k] - cand);
+        latent[k] = tanhf(j2);
+    }
+}
+
+extern "C" __global__ void dspark_hidden_corr(
+    float* corr,               // [n]
+    const float* hidden_out_b, // [n]
+    const float* h_row,        // [n]
+    int n                      // 2304
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        corr[i] = corr[i] + hidden_out_b[i] + h_row[i];
+    }
+}
+
+extern "C" __global__ void dspark_kv_store(
+    const float* k_new,      // [keep, kw]
+    const float* v_new,      // [keep, kw]
+    float* k_cache,          // [ring, kw]
+    float* v_cache,          // [ring, kw]
+    int pos0,
+    int keep,
+    int kw,
+    int ring
+) {
+    int t = blockIdx.x;      // token 0..keep-1
+    if (t >= keep) return;
+    int slot = (pos0 + t) % ring;
+    for (int j = threadIdx.x; j < kw; j += blockDim.x) {
+        k_cache[(size_t)slot * kw + j] = k_new[(size_t)t * kw + j];
+        v_cache[(size_t)slot * kw + j] = v_new[(size_t)t * kw + j];
+    }
+}

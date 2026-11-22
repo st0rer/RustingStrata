@@ -562,6 +562,14 @@ impl<'a> Inkling2Model<'a> {
         self.ngram.as_ref().is_some_and(|ng| ng.cfg.is_enabled()) || self.dspark.is_some()
     }
 
+    pub fn init_dspark_gpu(&mut self) {
+        if let (Some(d), Some(ds)) = (&mut self.device, &self.dspark) {
+            if let Err(e) = d.init_dspark(self.max_ctx, ds) {
+                eprintln!("inkling2: GPU DSpark init failed ({e:#}), will use CPU DSpark");
+            }
+        }
+    }
+
     /// Look up `tok` in `tok_embd` and RMS-normalize with `tok_norm` (`cfg.eps`), writing `out` (`[n_embd]`).
     pub fn embed_normed(&self, tok: u32, out: &mut [f32]) {
         assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
@@ -1044,9 +1052,10 @@ impl<'a> Inkling2Model<'a> {
     }
 
     fn commit_batch(&mut self, pos0: usize, keep: usize, nt: usize, cand: &[u32], feats: Option<&[f32]>) {
-        if let Some(d) = &self.device {
+        if let Some(mut d) = self.device.take() {
             d.commit_verify(self, pos0, keep, nt).expect("inkling2 commit_verify");
             self.toks.extend_from_slice(&cand[..keep]);
+            self.device = Some(d);
         }
         if let Some(ng) = &mut self.ngram {
             ng.accept(&cand[..keep]);
@@ -1067,9 +1076,18 @@ impl<'a> Inkling2Model<'a> {
         }
         if draft.is_empty() && cap_ds > 0 && self.dspark.is_some() {
             let pos0 = self.toks.len();
-            let ds = self.dspark.take().unwrap();
-            draft = ds.draft(self, anchor_tok, pos0, cap_ds);
-            self.dspark = Some(ds);
+            if self.device.as_ref().is_some_and(|d| d.dspark_gpu.is_some()) && self.output.gpu.is_some() {
+                let mut emb = vec![0.0f32; self.cfg.n_embd];
+                self.embed_normed(anchor_tok, &mut emb);
+                let (output_gpu, n_vocab, softcap) = (self.output.gpu.unwrap(), self.cfg.n_vocab, self.cfg.softcap);
+                if let Some(d) = &mut self.device {
+                    draft = d.dspark_draft(output_gpu, n_vocab, softcap, &emb, anchor_tok, pos0, cap_ds);
+                }
+            } else {
+                let ds = self.dspark.take().unwrap();
+                draft = ds.draft(self, anchor_tok, pos0, cap_ds);
+                self.dspark = Some(ds);
+            }
         }
         if let Some(p) = draft.iter().position(|t| eos.contains(t)) {
             draft.truncate(p + 1);
@@ -1221,6 +1239,9 @@ impl<'a> Inkling2Model<'a> {
         self.slots.clone_from(&ckpt.slots);
         if let Some(d) = &mut self.device {
             d.restore_checkpoint(&ckpt.dev_hist, &ckpt.dev_swa, ckpt.dev_synced, ckpt.dev_ahead);
+            if let Some(ds) = &mut d.dspark_gpu {
+                ds.truncate(self.toks.len());
+            }
         }
         if let Some(ng) = &mut self.ngram {
             ng.begin(&self.toks);

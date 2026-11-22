@@ -398,6 +398,31 @@ pub trait Backend: Send {
     fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
     /// Grouped dynamic causal convolution for DFlash2 (`part = 0` prepare, `part = 1` finish).
     fn dflash2_conv(&self, x: u64, dyn_w: u64, base: u64, out: u64, h: usize, gs: usize, k: usize, t: usize, part: usize) -> anyhow::Result<()>;
+    // Inkling 2 DSpark GPU speculative drafting kernels:
+    fn dspark_init_inp(&self, _anchor_emb: u64, _mask_emb: u64, _inp: u64, _n: usize, _bs: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
+    fn dspark_mix_norm(&self, _feats: u64, _fuse_w: u64, _norm_w: u64, _out: u64, _keep: usize, _stride_nt: usize, _n: usize, _eps: f32) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
+    fn dspark_norm_rope(&self, _x: u64, _norm_w: u64, _out: u64, _hd: usize, _nh: usize, _pos0: usize, _nt: usize, _eps: f32, _theta: f32) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
+    fn dspark_attn(&self, _q: u64, _kc: u64, _vc: u64, _k_blk: u64, _v_blk: u64, _out: u64, _first: usize, _n_ctx: usize, _ring: usize, _bs: usize, _nh: usize, _nkv: usize, _hd: usize, _scale: f32) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
+    fn dspark_markov_prep(&self, _prev_tok: u32, _markov_w1: u64, _state: u64, _h_row: u64, _ctx_feat: u64, _joint_in: u64, _n: usize, _rank: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
+    fn dspark_markov_step(&self, _joint: u64, _joint_bias: u64, _state: u64, _latent: u64, _rank: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
+    fn dspark_hidden_corr(&self, _corr: u64, _hidden_out_b: u64, _h_row: u64, _n: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
+    fn dspark_kv_store(&self, _k_new: u64, _v_new: u64, _k_cache: u64, _v_cache: u64, _pos0: usize, _keep: usize, _kw: usize, _ring: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: DSpark GPU not implemented", self.name())
+    }
     /// `qg` 0: no output gate.
     fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
         self.attn_prefill_m(q, kc, vc, qg, out, step, t, nh, nkv, hd, scale, 0, 0, 0, 0)

@@ -2,6 +2,7 @@
 //! `inkling2` with `num_loops` (the layout of llama.cpp PR #32695, which Unsloth's files use).
 pub mod chat;
 pub mod dspark;
+pub mod dspark_gpu;
 pub mod forward;
 
 use crate::gguf::Gguf;

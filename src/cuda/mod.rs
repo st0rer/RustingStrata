@@ -17,13 +17,14 @@ const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-const KERNELS: [&str; 54] = [
+const KERNELS: [&str; 62] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
     "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_ffn_sum", "ink_route",
+    "dspark_init_inp", "dspark_mix_norm", "dspark_norm_rope", "dspark_attn", "dspark_markov_prep", "dspark_markov_step", "dspark_hidden_corr", "dspark_kv_store",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -1205,6 +1206,48 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    fn dspark_init_inp(&self, anchor_emb: u64, mask_emb: u64, inp: u64, n: usize, bs: usize) -> anyhow::Result<()> {
+        let grid = n.div_ceil(256) as u32;
+        launch!(self, "dspark_init_inp", cfg((grid, 1), 256, 0), anchor_emb, mask_emb, inp, n as i32, bs as i32);
+        Ok(())
+    }
+
+    fn dspark_mix_norm(&self, feats: u64, fuse_w: u64, norm_w: u64, out: u64, keep: usize, stride_nt: usize, n: usize, eps: f32) -> anyhow::Result<()> {
+        launch!(self, "dspark_mix_norm", cfg((keep as u32, 1), 256, 0), feats, fuse_w, norm_w, out, keep as i32, stride_nt as i32, n as i32, eps);
+        Ok(())
+    }
+
+    fn dspark_norm_rope(&self, x: u64, norm_w: u64, out: u64, hd: usize, nh: usize, pos0: usize, nt: usize, eps: f32, theta: f32) -> anyhow::Result<()> {
+        launch!(self, "dspark_norm_rope", cfg((nh as u32, nt as u32), 128, 0), x, norm_w, out, hd as i32, nh as i32, pos0 as i32, nt as i32, eps, theta);
+        Ok(())
+    }
+
+    fn dspark_attn(&self, q: u64, kc: u64, vc: u64, k_blk: u64, v_blk: u64, out: u64, first: usize, n_ctx: usize, ring: usize, bs: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+        launch!(self, "dspark_attn", cfg((nh as u32, bs as u32), 128, 0), q, kc, vc, k_blk, v_blk, out, first as i32, n_ctx as i32, ring as i32, bs as i32, nh as i32, nkv as i32, hd as i32, scale);
+        Ok(())
+    }
+
+    fn dspark_markov_prep(&self, prev_tok: u32, markov_w1: u64, state: u64, h_row: u64, ctx_feat: u64, joint_in: u64, n: usize, rank: usize) -> anyhow::Result<()> {
+        launch!(self, "dspark_markov_prep", cfg((1, 1), 256, 0), prev_tok as i32, markov_w1, state, h_row, ctx_feat, joint_in, n as i32, rank as i32);
+        Ok(())
+    }
+
+    fn dspark_markov_step(&self, joint: u64, joint_bias: u64, state: u64, latent: u64, rank: usize) -> anyhow::Result<()> {
+        launch!(self, "dspark_markov_step", cfg((1, 1), 256, 0), joint, joint_bias, state, latent, rank as i32);
+        Ok(())
+    }
+
+    fn dspark_hidden_corr(&self, corr: u64, hidden_out_b: u64, h_row: u64, n: usize) -> anyhow::Result<()> {
+        let grid = n.div_ceil(256) as u32;
+        launch!(self, "dspark_hidden_corr", cfg((grid, 1), 256, 0), corr, hidden_out_b, h_row, n as i32);
+        Ok(())
+    }
+
+    fn dspark_kv_store(&self, k_new: u64, v_new: u64, k_cache: u64, v_cache: u64, pos0: usize, keep: usize, kw: usize, ring: usize) -> anyhow::Result<()> {
+        launch!(self, "dspark_kv_store", cfg((keep as u32, 1), 256, 0), k_new, v_new, k_cache, v_cache, pos0 as i32, keep as i32, kw as i32, ring as i32);
+        Ok(())
+    }
+
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize, sink: u64, win: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
         // Turing keeps 16 keys a tile for head_dim 256 (see FA_BK_FOR in kernels.cu).
@@ -1503,8 +1546,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 370);
-        assert_eq!(sm70.len(), 324);
+        assert_eq!(sm80.len(), 378);
+        assert_eq!(sm70.len(), 332);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

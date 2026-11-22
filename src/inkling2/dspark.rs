@@ -191,6 +191,14 @@ impl DsparkDrafter {
         })
     }
 
+    pub fn gguf(&self) -> &Gguf {
+        &self._gguf
+    }
+
+    pub fn fuse(&self) -> &[f32] {
+        &self.fuse
+    }
+
     pub fn reset(&mut self) {
         self.truncate(0);
     }

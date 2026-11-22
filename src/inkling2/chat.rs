@@ -42,10 +42,13 @@ impl Inkling2Opts {
         };
         let mut m = Inkling2Model::new_with_ctx(g, self.max_ctx)?;
         m.dspark = dspark;
+        m.init_dspark_gpu();
         m.spec_draft_max = if self.ngram_cfg.is_enabled() {
             self.ngram_cfg.draft_max
         } else if self.ngram_cfg.draft_max != 16 {
             self.ngram_cfg.draft_max
+        } else if m.dspark.is_some() {
+            7
         } else {
             3
         };

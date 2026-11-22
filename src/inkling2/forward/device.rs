@@ -158,6 +158,7 @@ pub(super) struct Device {
     /// Positions whose rows both sides hold, and whether the device has run tokens after them.
     synced: usize,
     ahead: bool,
+    pub dspark_gpu: Option<super::super::dspark_gpu::GpuDspark>,
 }
 
 fn up<T: crate::backend::Plain>(be: &dyn Backend, v: &[T]) -> Result<Buf> {
@@ -337,14 +338,55 @@ impl Device {
                 eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
             }
             let all_full = layers.iter().all(|l| l.full_exps.is_some());
-            Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, graph_keys: [0; 2], synced: 0, ahead: false })
+            let mut dev = Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, graph_keys: [0; 2], synced: 0, ahead: false, dspark_gpu: None };
+            if let Some(ds) = &m.dspark {
+                if let Err(e) = dev.init_dspark(m.max_ctx, ds) {
+                    eprintln!("inkling2: GPU DSpark init failed ({e:#}), will use CPU DSpark");
+                }
+            }
+            Ok(dev)
         })();
         made.inspect_err(|e| eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
+    }
+
+    pub fn init_dspark(&mut self, max_ctx: usize, ds: &super::super::dspark::DsparkDrafter) -> Result<()> {
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let full = (2 * (self.synced + 1)).clamp(4096.min(max_ctx), max_ctx).min(32768);
+        let gpu_ds = super::super::dspark_gpu::GpuDspark::new(be, ds, full)?;
+        eprintln!("inkling2: DSpark GPU drafter initialized successfully (3 layers + Markov RNN in VRAM)");
+        self.dspark_gpu = Some(gpu_ds);
+        Ok(())
+    }
+
+    pub fn dspark_draft(
+        &mut self,
+        output_gpu: u32,
+        n_vocab: usize,
+        softcap: f32,
+        anchor_emb: &[f32],
+        anchor_tok: u32,
+        pos0: usize,
+        max_draft: usize,
+    ) -> Vec<u32> {
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let target_out = d.tensor(output_gpu);
+        let s = self.s;
+        if let Some(ds) = &mut self.dspark_gpu {
+            ds.draft(be, target_out, s.logits, n_vocab, softcap, anchor_emb, anchor_tok, pos0, max_draft)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     }
 
     /// The model starts over: nothing is shared with the host's rows.
     pub(super) fn forget(&mut self) {
         (self.synced, self.ahead) = (0, false);
+        if let Some(ds) = &mut self.dspark_gpu {
+            ds.truncate(0);
+        }
     }
 
     /// Save conv histories and SWA ring buffers for fast prefix rollback (full-attention KV rows `< pos` are untouched by later tokens).
@@ -788,7 +830,12 @@ impl Device {
             be.ink_mix_n(pf.p.blocks, nb, cur_a, self.out_query.addr(), 1, pf.p.h, n, nt)?;
             be.rms_norm(pf.p.h, n, self.out_norm.addr(), pf.p.hn, n, n, nt, c.eps)?;
             be.dtod(&pf.buf, (pf.p.hn - o) as usize, &pf.dspark_buf, 3 * 4 * nt * n, 4 * nt * n)?;
-            Some(be.get(&pf.dspark_buf, 0, 4 * nt * n)?)
+            if let Some(ds_gpu) = &mut self.dspark_gpu {
+                let _ = ds_gpu.inject_subset(be, pos0, nt, nt, pf.dspark_buf.addr());
+                None
+            } else {
+                Some(be.get(&pf.dspark_buf, 0, 4 * nt * n)?)
+            }
         } else {
             None
         };
@@ -917,7 +964,11 @@ impl Device {
             }
             let dspark = if capture_dspark {
                 be.dtod(&pf.buf, (pf.p.hn - o) as usize, &pf.dspark_buf, 3 * 4 * nt * n, 4 * nt * n)?;
-                Some(be.get(&pf.dspark_buf, 0, 4 * nt * n)?)
+                if self.dspark_gpu.is_some() {
+                    None
+                } else {
+                    Some(be.get(&pf.dspark_buf, 0, 4 * nt * n)?)
+                }
             } else {
                 None
             };
@@ -931,7 +982,13 @@ impl Device {
     }
 
     /// Commit the first `keep` (`1 <= keep <= nt`) tokens of a `verify_forward` pass on the GPU in place.
-    pub(super) fn commit_verify(&self, m: &Inkling2Model, pos0: usize, keep: usize, nt: usize) -> Result<()> {
+    pub(super) fn commit_verify(&mut self, m: &Inkling2Model, pos0: usize, keep: usize, nt: usize) -> Result<()> {
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let pf = self.pf.as_ref().unwrap();
+        if let Some(ds_gpu) = &mut self.dspark_gpu {
+            ds_gpu.inject_subset(be, pos0, keep, nt, pf.dspark_buf.addr())?;
+        }
         if keep >= nt { return Ok(()); }
         let c = &m.cfg;
         let (n, kw, hm) = (c.n_embd, c.n_head_kv * c.head_dim, c.n_conv - 1);
@@ -939,9 +996,6 @@ impl Device {
         let conv_widths = [kw, kw, n, n];
         let log_slot_bytes = 4 * VERIFY_MAX * (2 * kw + 2 * n);
         let log_offs = [0, 4 * VERIFY_MAX * kw, 4 * VERIFY_MAX * 2 * kw, 4 * VERIFY_MAX * (2 * kw + n)];
-        let d = dev::get().unwrap().lock().unwrap();
-        let be = &*d.parts[0].be;
-        let pf = self.pf.as_ref().unwrap();
         let rb = 2 * be.kv_words(kw);
         for (il, ds) in self.slots.iter().enumerate() {
             let ip = layer_of(c, il);
@@ -978,7 +1032,7 @@ impl Device {
     /// on Vulkan the matvec kernels are faster up to `VERIFY_MAX` rows. A prompt chunk keeps the old limit, so the
     /// logits of a plain run are unchanged.
     fn small(be: &dyn Backend, nt: usize, verify: bool) -> bool {
-        nt <= if verify && be.name() == "cuda" { 6 } else { VERIFY_MAX }
+        nt <= if verify && be.name() == "cuda" { 8 } else { VERIFY_MAX }
     }
 
     fn proj_n(be: &dyn Backend, w: &GpuTensor, small: bool, nt: usize, x: u64, xq: u64, y: u64, act: i32) -> Result<()> {
