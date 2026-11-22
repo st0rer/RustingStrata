@@ -701,9 +701,11 @@ impl Device {
             be.sync()?;
             self.pf = None;
         }
-        let target = need_nt.max(256).min(1024);
+        let target = need_nt.max(256).min(4096);
         let mut tries = vec![target];
         if need_nt < target {
+            if target > 2048 { tries.push(need_nt.max(2048)); }
+            if target > 1024 { tries.push(need_nt.max(1024)); }
             if target > 512 { tries.push(need_nt.max(512)); }
             if target > 256 { tries.push(need_nt.max(256)); }
             tries.push(need_nt.max(128));
@@ -1232,24 +1234,24 @@ impl Device {
                     let np = nt * k;
 
                     // 1. Counting sort: 0 nested Vec allocations (was 128 heap allocations every layer)
-                    let mut e_cnt = vec![0u16; c.n_expert];
+                    let mut e_cnt = vec![0u32; c.n_expert];
                     for &e in &ids {
                         if (e as usize) < c.n_expert {
                             e_cnt[e as usize] += 1;
                         }
                     }
-                    let mut e_head = vec![0u16; c.n_expert];
-                    let mut sum = 0u16;
+                    let mut e_head = vec![0u32; c.n_expert];
+                    let mut sum = 0u32;
                     for e in 0..c.n_expert {
                         e_head[e] = sum;
                         sum += e_cnt[e];
                     }
                     let mut e_cur = e_head.clone();
-                    let mut sorted_tj = vec![(0u16, 0u8); np];
+                    let mut sorted_tj = vec![(0u32, 0u8); np];
                     for (t, row) in ids.chunks_exact(k).enumerate() {
                         for (j, &e) in row.iter().enumerate() {
                             let slot = &mut e_cur[e as usize];
-                            sorted_tj[*slot as usize] = (t as u16, j as u8);
+                            sorted_tj[*slot as usize] = (t as u32, j as u8);
                             *slot += 1;
                         }
                     }
