@@ -3,7 +3,7 @@
 
 use crate::quant::{GgmlType, tables::*};
 use anyhow::{Context, bail};
-use crate::backend::{Backend, Buf, SAME_X};
+use crate::backend::{Backend, Buf, SAME_X, GEMM_ONLY_SMALL, GEMM_ONLY_LARGE};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, LaunchConfig, PushKernelArg, result, sys};
 use cudarc::nvrtc::Ptx;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -601,25 +601,32 @@ impl Gpu {
         // the cached q8 rows are not x's (or, without SAME_X, may not be), use the f16 kernel. Volta and Turing have no int8 tensor-core mma: there the
         // kernels are not loaded (`i8_gemm`), so this gate must dominate `STRATA_MMQ`; they take the f16 gemm_*/gemms_*.
         let int8 = self.i8_gemm && self.int8_mma && Self::mmq(ty) && cols.is_multiple_of(128);
+        let only_small = act & GEMM_ONLY_SMALL != 0;
+        let only_large = act & GEMM_ONLY_LARGE != 0;
+        let act_mode = act & 3;
         if !int8 || (!reuse && self.nb.load(Relaxed) < BESIDE) {
             if !same { q8.1 = None; }
-            launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
-                tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
+            if !only_small {
+                launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                    tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act_mode, w_scale);
+            }
             // Tile lists: gemm_* skips the tiles of at most 32 positions, which gemms_* takes.
-            if tiles != 0 {
+            if tiles != 0 && !only_large {
                 launch!(self, &kname("gemms", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
-                    tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
+                    tiles, wd, nd as i32, x, x_stride as i32, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act_mode, w_scale);
             }
             return Ok(());
         }
         // Only SAME_X promises that x still holds what was quantized: the same address can hold new rows.
         if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
-        launch!(self, &kname(if sm { "gemmis" } else { "gemmi" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
-            tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
-        if tiles != 0 {
+        if !only_small {
+            launch!(self, &kname(if sm { "gemmis" } else { "gemmi" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
+                tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act_mode, w_scale);
+        }
+        if tiles != 0 && !only_large {
             launch!(self, &kname("gemmis", ty), cfg(grid, 2 * GEMM_BM as u32, 0),
-                tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act, w_scale);
+                tiles, wd, nd as i32, xq, xrow, y, y_stride as i32, rows as i32, (cols / 64) as i32, act_mode, w_scale);
         }
         Ok(())
     }

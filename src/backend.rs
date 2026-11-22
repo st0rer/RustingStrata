@@ -91,6 +91,10 @@ pub fn device_order<T: PartialEq>(cuda: &[Option<T>], vk: &[T]) -> Vec<Option<us
 
 /// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
 pub const SAME_X: i32 = 4;
+/// `gemm` `act` flag: tile list contains only small tiles (<= 32 positions), so skip the large `gemm` kernel.
+pub const GEMM_ONLY_SMALL: i32 = 8;
+/// `gemm` `act` flag: tile list contains only large tiles (> 32 positions), so skip the small `gemms` kernel.
+pub const GEMM_ONLY_LARGE: i32 = 16;
 
 /// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
 /// value exactly). Expert tensors are copied raw by `GpuModel::load_part`, not through `upload`.

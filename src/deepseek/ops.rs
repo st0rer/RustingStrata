@@ -17,6 +17,15 @@ pub fn rms_norm_w(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
+/// In-place RMS norm and scale by weight: x[i] = (x[i] / sqrt(mean(x^2) + eps)) * w[i].
+pub fn rms_norm_w_inplace(x: &mut [f32], w: &[f32], eps: f32) {
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let s = 1.0 / (ms + eps).sqrt();
+    for (v, w) in x.iter_mut().zip(w) {
+        *v = *v * s * w;
+    }
+}
+
 /// ggml YaRN rope parameters for one layer kind.
 #[derive(Clone, Copy, Debug)]
 pub struct Rope {

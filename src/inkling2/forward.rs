@@ -573,9 +573,8 @@ impl<'a> Inkling2Model<'a> {
     /// Look up `tok` in `tok_embd` and RMS-normalize with `tok_norm` (`cfg.eps`), writing `out` (`[n_embd]`).
     pub fn embed_normed(&self, tok: u32, out: &mut [f32]) {
         assert!((tok as usize) < self.tok_embd.rows, "token {tok} is outside the vocabulary");
-        let mut emb = vec![0.0f32; self.cfg.n_embd];
-        self.tok_embd.row_into(tok as usize, &mut emb);
-        rms_norm_w(&emb, &self.tok_norm, self.cfg.eps, out);
+        self.tok_embd.row_into(tok as usize, out);
+        crate::deepseek::ops::rms_norm_w_inplace(out, &self.tok_norm, self.cfg.eps);
     }
 
     /// Project a single hidden state `h` (`[n_embd]`) through the target LM head (`output.weight`) with optional
@@ -1274,7 +1273,7 @@ impl<'a> Inkling2Model<'a> {
                 let target_end = self.toks.len() + seq.len() - 1;
                 match d.prepare(self, target_end) {
                     Ok(()) => {
-                        let chunk = env_chunk.unwrap_or(256).clamp(1, 256);
+                        let chunk = env_chunk.unwrap_or(512).clamp(1, 1024);
                         let mut logits = vec![];
                         let mut done = 0usize;
                         let mut failed = None;

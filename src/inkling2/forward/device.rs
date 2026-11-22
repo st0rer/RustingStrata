@@ -701,9 +701,15 @@ impl Device {
             be.sync()?;
             self.pf = None;
         }
-        let target = need_nt.max(256).min(256);
+        let target = need_nt.max(256).min(1024);
         let mut tries = vec![target];
-        if need_nt < target { tries.push(need_nt.max(128)); tries.push(need_nt.max(64)); tries.push(need_nt); }
+        if need_nt < target {
+            if target > 512 { tries.push(need_nt.max(512)); }
+            if target > 256 { tries.push(need_nt.max(256)); }
+            tries.push(need_nt.max(128));
+            tries.push(need_nt.max(64));
+            tries.push(need_nt);
+        }
         let mut last_err = None;
         for cap in tries {
             match PrefillScratch::alloc(be, c, self.rank, vocab_rows, cap) {
@@ -1223,42 +1229,76 @@ impl Device {
                 } else {
                     use crate::backend::GEMM_BM;
                     let ids: Vec<i32> = be.get(&pf.buf, ((p.ids - buf_o) / 4) as usize, nt * k)?;
-                    let mut by_e: Vec<Vec<(usize, usize)>> = vec![vec![]; c.n_expert];
-                    for (t, row) in ids.chunks_exact(k).enumerate() {
-                        for (j, &e) in row.iter().enumerate() { by_e[e as usize].push((t, j)); }
-                    }
                     let np = nt * k;
+
+                    // 1. Counting sort: 0 nested Vec allocations (was 128 heap allocations every layer)
+                    let mut e_cnt = vec![0u16; c.n_expert];
+                    for &e in &ids {
+                        if (e as usize) < c.n_expert {
+                            e_cnt[e as usize] += 1;
+                        }
+                    }
+                    let mut e_head = vec![0u16; c.n_expert];
+                    let mut sum = 0u16;
+                    for e in 0..c.n_expert {
+                        e_head[e] = sum;
+                        sum += e_cnt[e];
+                    }
+                    let mut e_cur = e_head.clone();
+                    let mut sorted_tj = vec![(0u16, 0u8); np];
+                    for (t, row) in ids.chunks_exact(k).enumerate() {
+                        for (j, &e) in row.iter().enumerate() {
+                            let slot = &mut e_cur[e as usize];
+                            sorted_tj[*slot as usize] = (t as u16, j as u8);
+                            *slot += 1;
+                        }
+                    }
+
                     let mut tiles_gu: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
                     let mut tiles_dn: Vec<u64> = Vec::with_capacity(2 * (c.n_expert + np / GEMM_BM));
                     let mut xrow: Vec<i32> = Vec::with_capacity(np);
-                    let mut inv: Vec<i32> = vec![0i32; nt * k];
+                    let mut inv: Vec<i32> = vec![0i32; np];
                     let mut gsc_rows: Vec<f32> = if ml.gu_scale.is_empty() { Vec::new() } else { Vec::with_capacity(np) };
                     let mut m0 = 0usize;
+                    let mut has_small = false;
+                    let mut has_large = false;
                     for e in 0..c.n_expert {
-                        if by_e[e].is_empty() { continue; }
+                        let cnt_e = e_cnt[e] as usize;
+                        if cnt_e == 0 { continue; }
                         let wg = fe.gu.addr() + (e * fe.gu_stride) as u64;
                         let wd = fe.dn.addr() + (e * fe.dn_stride) as u64;
-                        for at in (0..by_e[e].len()).step_by(GEMM_BM) {
-                            let cnt = GEMM_BM.min(by_e[e].len() - at) as u64;
+                        for at in (0..cnt_e).step_by(GEMM_BM) {
+                            let cnt = GEMM_BM.min(cnt_e - at) as u64;
+                            if cnt <= 32 { has_small = true; } else { has_large = true; }
                             tiles_gu.extend([wg, (m0 + at) as u64 | (cnt << 32)]);
                             tiles_dn.extend([wd, (m0 + at) as u64 | (cnt << 32)]);
                         }
-                        for &(t, j) in &by_e[e] {
-                            inv[t * k + j] = xrow.len() as i32;
+                        let start = e_head[e] as usize;
+                        for &(t, j) in &sorted_tj[start..start + cnt_e] {
+                            inv[(t as usize) * k + (j as usize)] = xrow.len() as i32;
                             xrow.push(t as i32);
                             if !ml.gu_scale.is_empty() { gsc_rows.push(ml.gu_scale[e]); }
                         }
-                        m0 += by_e[e].len();
+                        m0 += cnt_e;
                     }
                     let n_tiles = tiles_gu.len() / 2;
                     let dn_off = 8 * tiles_gu.len();
                     let xr_off = dn_off + 8 * tiles_dn.len();
                     let inv_off = xr_off + 4 * np;
-                    ensure!(inv_off + 4 * nt * k <= pf.meta.len(), "prefill meta overflow");
-                    be.put(&tiles_gu, &pf.meta, 0)?;
-                    be.put(&tiles_dn, &pf.meta, dn_off / 8)?;
-                    be.put(&xrow, &pf.meta, xr_off / 4)?;
-                    be.put(&inv, &pf.meta, inv_off / 4)?;
+                    let total_meta_bytes = inv_off + 4 * np;
+                    ensure!(total_meta_bytes <= pf.meta.len(), "prefill meta overflow");
+
+                    // 2. Coalesce all 4 metadata arrays into a single HtoD copy (was 4 separate cudaMemcpy calls per layer)
+                    let mut meta_bytes = vec![0u8; total_meta_bytes];
+                    unsafe {
+                        let ptr = meta_bytes.as_mut_ptr();
+                        std::ptr::copy_nonoverlapping(tiles_gu.as_ptr() as *const u8, ptr, 8 * tiles_gu.len());
+                        std::ptr::copy_nonoverlapping(tiles_dn.as_ptr() as *const u8, ptr.add(dn_off), 8 * tiles_dn.len());
+                        std::ptr::copy_nonoverlapping(xrow.as_ptr() as *const u8, ptr.add(xr_off), 4 * np);
+                        std::ptr::copy_nonoverlapping(inv.as_ptr() as *const u8, ptr.add(inv_off), 4 * np);
+                    }
+                    be.put(&meta_bytes, &pf.meta, 0)?;
+
                     let gsc_a = if !gsc_rows.is_empty() {
                         be.put(&gsc_rows, &pf.buf, ((p.gsc - buf_o) / 4) as usize)?;
                         p.gsc
@@ -1266,9 +1306,18 @@ impl Device {
                         0
                     };
                     let ma = pf.meta.addr();
-                    be.gemm(fe.gu_ty, fe.gu_rows, fe.gu_cols, ma, n_tiles, p.hn, n, nt, ma + xr_off as u64, p.y, 2 * nf, 0)?;
+
+                    // 3. Smart GEMM dispatch: skip launching empty kernels when all tiles <= 32 (saves 96 launches/prefill)
+                    let act_flags = if has_small && !has_large {
+                        crate::backend::GEMM_ONLY_SMALL
+                    } else if has_large && !has_small {
+                        crate::backend::GEMM_ONLY_LARGE
+                    } else {
+                        0
+                    };
+                    be.gemm(fe.gu_ty, fe.gu_rows, fe.gu_cols, ma, n_tiles, p.hn, n, nt, ma + xr_off as u64, p.y, 2 * nf, act_flags)?;
                     be.situ(p.y, nf, np, gsc_a, c.situ_beta, c.situ_linear_beta)?;
-                    be.gemm(fe.dn_ty, fe.dn_rows, fe.dn_cols, ma + dn_off as u64, n_tiles, p.y, 2 * nf, np, 0, p.d, n, 0)?;
+                    be.gemm(fe.dn_ty, fe.dn_rows, fe.dn_cols, ma + dn_off as u64, n_tiles, p.y, 2 * nf, np, 0, p.d, n, act_flags)?;
                     be.memset(&pf.acc_buf)?;
                     be.moe_combine_seq(pf.acc_buf.addr(), p.d, p.wts, ma + inv_off as u64, k, 0, 0, n, nt)?;
                 }
