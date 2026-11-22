@@ -99,7 +99,12 @@ pub fn extra_opts() -> String { std::env::var("STRATA_NVRTC_OPTS").unwrap_or_def
 pub fn cubin(src: &str, arch: &str) -> anyhow::Result<Vec<u8>> {
     let n = lib().ok_or_else(missing)?;
     let src = CString::new(src)?;
-    let mut opts = vec![CString::new(format!("--gpu-architecture={arch}"))?, CString::new("-std=c++17")?];
+    let mut opts = vec![
+        CString::new(format!("--gpu-architecture={arch}"))?,
+        CString::new("-std=c++17")?,
+        CString::new("--use_fast_math")?,
+        CString::new("-extra-device-vectorization")?,
+    ];
     for o in extra_opts().split_whitespace() { opts.push(CString::new(o)?); }
     let ptrs: Vec<*const c_char> = opts.iter().map(|o| o.as_ptr()).collect();
     let ok = |r: c_int, what: &str| if r == 0 { Ok(()) } else { Err(anyhow::anyhow!("{what} failed: NVRTC error {r}")) };
