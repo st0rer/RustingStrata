@@ -2485,6 +2485,30 @@ __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
 #endif
 }
 
+// Direct row-based KV element load: eliminates runtime 64-bit division and modulo on every scalar.
+__device__ __forceinline__ float ldkv_row(const u16* c, size_t row_idx, int col, int hd) {
+#if KV_MODE == 3
+    const unsigned char* r = (const unsigned char*)c + row_idx * (size_t)(3 * hd / 8);
+    unsigned b = r[col >> 2];
+    float d = h2f(*(const u16*)(r + (hd >> 2) + 2 * (col >> 5)));
+    float mn = h2f(*(const u16*)(r + (hd >> 2) + (hd >> 4) + 2 * (col >> 5)));
+    int q = (b >> (2 * (col & 3))) & 3;
+    return rh(fmaf((float)q, d, mn));
+#elif KV_MODE == 2
+    const unsigned char* r = (const unsigned char*)c + row_idx * (size_t)(hd / 2 + hd / 16);
+    unsigned b = r[col >> 1];
+    float d = h2f(*(const u16*)(r + (hd >> 1) + 2 * (col >> 5)));
+    int q = (int)((col & 1) == 0 ? (b & 15u) : (b >> 4)) - 8;
+    return rh((float)q * d);
+#elif KV_MODE == 1
+    const signed char* r = (const signed char*)c + row_idx * (size_t)(hd + hd / 16);
+    float d = h2f(*(const u16*)(r + hd + 2 * (col >> 5)));
+    return rh((float)r[col] * d);
+#else
+    return h2f(((const u16*)c)[row_idx * (size_t)hd + col]);
+#endif
+}
+
 // One block of 128 per (row, tok) of w values (w at most 128, w % 32 == 0 when KV_MODE > 0 and dst != 0).
 extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst,
                                     int dst_at0, int dst_ring, int pos0, float log_alpha, float log_floor, const int* pos_ptr) {
@@ -2525,9 +2549,9 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     float scale = 1.f / sqrtf((float)hd);
     for (int j = t >> 5; j < n; j += 4) {
         int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
-        size_t ko = (size_t)i * kw + kh * hd;
+        size_t row_idx = (size_t)i * (size_t)nkv + (size_t)kh;
         float d = 0.f;
-        for (int c = lane; c < hd; c += 32) d += qs[c] * ldkv1(k, ko + c, hd);
+        for (int c = lane; c < hd; c += 32) d += qs[c] * ldkv_row(k, row_idx, c, hd);
         d *= scale;
         if (dist < ext) for (int c = lane; c < nr; c += 32) d += r[h * nr + c] * bias[dist * nr + c];
         d = warp_sum(d);
@@ -2541,7 +2565,7 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     __syncthreads();
     int c = t % hd, parts = 128 / hd;
     float a = 0.f;
-    for (int j = t / hd; j < n; j += parts) a += ps[j] * ldkv1(v, (size_t)(i0 + j) * kw + kh * hd + c, hd);
+    for (int j = t / hd; j < n; j += parts) a += ps[j] * ldkv_row(v, (size_t)(i0 + j) * (size_t)nkv + (size_t)kh, c, hd);
     acc[t] = a;
     __syncthreads();
     float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
@@ -2598,9 +2622,9 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
         const u16* kbuf = use_new ? kc_new : kc;
         const u16* vbuf = use_new ? vc_new : vc;
         size_t row = use_new ? (size_t)(kp - pos) : (win > 0 ? (size_t)(kp % ring) : (size_t)kp);
-        size_t kbase = row * kw + (size_t)kh * HD;
+        size_t row_idx = row * (size_t)nkv + (size_t)kh;
         float s = 0.f;
-        for (int j = 0; j < PER; j++) s += qv[j] * ldkv1(kbuf, kbase + lane + 32 * j, HD);
+        for (int j = 0; j < PER; j++) s += qv[j] * ldkv_row(kbuf, row_idx, lane + 32 * j, HD);
         s = warp_sum(s);
         int dist = q_pos - kp;
         float b = 0.f;
@@ -2615,7 +2639,7 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
         float logit = s + b - sink_val;
         float mn = fmaxf(m, logit), c = expf(m - mn), e = expf(logit - mn);
         l = l * c + e;
-        for (int j = 0; j < PER; j++) acc[j] = e * ldkv1(vbuf, kbase + lane + 32 * j, HD) + acc[j] * c;
+        for (int j = 0; j < PER; j++) acc[j] = e * ldkv_row(vbuf, row_idx, lane + 32 * j, HD) + acc[j] * c;
         m = mn;
     }
     float inv = 1.f / l;
