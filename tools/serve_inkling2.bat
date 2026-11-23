@@ -29,7 +29,8 @@ start /affinity 0xE "" "%BIN%" serve ^
   --spec-draft-n-max 3 ^
   --gpu ^
   --chunk 2048 ^
-  --ctx 65536 ^
+  --ctx 512000 ^
+  --kv q8 ^
   --vram-margin 512 ^
   --addr 0.0.0.0:8081 ^
   --temp 0.2 ^

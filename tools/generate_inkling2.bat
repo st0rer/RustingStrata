@@ -18,4 +18,4 @@ if "%~1"=="" (
     set "PROMPT=%~1"
 )
 
-powershell.exe -Command "& '%BIN%' generate --model '%MODEL%' --draft-model '%DRAFT%' --spec-draft-n-max 3 --gpu -n 128 --temp 0 --prompt '%PROMPT%'"
+powershell.exe -Command "& '%BIN%' generate --model '%MODEL%' --draft-model '%DRAFT%' --spec-draft-n-max 3 --gpu --chunk 2048 --ctx 512000 --kv q8 -n 128 --temp 0 --prompt '%PROMPT%'"

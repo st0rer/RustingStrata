@@ -30,6 +30,8 @@ start /affinity 0xE /b /wait "%BIN%" bench ^
   --spec-draft-n-max 3 ^
   --gpu ^
   --chunk 2048 ^
+  --ctx 512000 ^
+  --kv q8 ^
   --vram-margin 512 ^
   --pp 128,1024,4096 ^
   --tg 64 ^

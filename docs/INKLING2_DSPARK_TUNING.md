@@ -15,6 +15,8 @@ start /affinity 0xE /b /wait strata.exe bench ^
   --spec-draft-n-max 3 ^
   --gpu ^
   --chunk 2048 ^
+  --ctx 512000 ^
+  --kv q8 ^
   --vram-margin 512 ^
   --pp 128,1024,4096 ^
   --tg 64 ^
@@ -29,7 +31,8 @@ start /affinity 0xE "" strata.exe serve ^
   --spec-draft-n-max 3 ^
   --gpu ^
   --chunk 2048 ^
-  --ctx 65536 ^
+  --ctx 512000 ^
+  --kv q8 ^
   --vram-margin 512 ^
   --addr 0.0.0.0:8081 ^
   --temp 0.2 ^
@@ -45,6 +48,8 @@ start /affinity 0xE "" strata.exe serve ^
 
 | Parameter | Recommended Value | Reason |
 |---|---|---|
+| `--ctx` | **`512000`** | **512K Context:** Model native capacity expanded to 512,000 tokens. Dynamically reallocated up to 512K ceiling. |
+| `--kv` | **`q8`** | **Zero Quality Loss (8-bit):** Preserves full generation fidelity and accuracy with Q8_0 precision while halving KV memory footprint to 8.3 GB at 512K tokens (fits comfortably in 20GB VRAM alongside 11.5 GB weights). |
 | `--spec-draft-n-max` | **`3`** | **Sweet spot:** yields 85.2% - 93.3% acceptance rate while keeping LM-head memory bus reads under 4.0 GB per step. |
 | `--chunk` | **`2048`** | **Prefill peak:** delivers **750+ tok/s** on 1024-token contexts without thrashing the L2 cache. For ultra-long inputs, chunks scale up to 65,536 tokens. |
 | `--vram-margin` | **`512`** | Retains sufficient buffer for dynamic scratch expansions without triggering out-of-memory errors on 20GB cards. |
