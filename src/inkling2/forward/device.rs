@@ -762,10 +762,8 @@ impl Device {
         Ok(id)
     }
 
-    fn record_dspark_visit(&self, visit: usize, cur_a: u64, nt: usize, n: usize) -> Result<()> {
+    fn record_dspark_visit(&self, be: &dyn Backend, visit: usize, cur_a: u64, nt: usize, n: usize) -> Result<()> {
         let Some(k) = DSPARK_VISITS.iter().position(|&v| v == visit) else { return Ok(()) };
-        let d = dev::get().unwrap().lock().unwrap();
-        let be = &*d.parts[0].be;
         let pf = self.pf.as_ref().unwrap();
         let o = pf.buf.addr();
         be.dtod(&pf.buf, (cur_a - o) as usize, &pf.dspark_buf, k * 4 * nt * n, 4 * nt * n)
@@ -796,37 +794,26 @@ impl Device {
                 rms_norm_w(&emb, &m.tok_norm, c.eps, &mut cur_host[t * n..(t + 1) * n]);
             }
         }
-        let (mut cur_a, mut x_a) = {
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
-            self.ensure_pf(be, c, m.output.rows, nt)?;
-            if !self.ahead { self.to_device(m, be, pos0)?; }
-            let pf = self.pf.as_ref().unwrap();
-            be.put(&cur_host, &pf.buf, 0)?;
-            (pf.p.cur, pf.p.x)
-        };
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        self.ensure_pf(be, c, m.output.rows, nt)?;
+        if !self.ahead { self.to_device(m, be, pos0)?; }
+        let pf = self.pf.as_ref().unwrap();
+        be.put(&cur_host, &pf.buf, 0)?;
+        let (mut cur_a, mut x_a) = (pf.p.cur, pf.p.x);
         let mut nb = 0usize;
         let mut visit = 0usize;
         for il in 0..c.loop_start {
-            if capture_dspark { self.record_dspark_visit(visit, cur_a, nt, n)?; }
+            if capture_dspark { self.record_dspark_visit(be, visit, cur_a, nt, n)?; }
             visit += 1;
-            self.prefill_layer(m, il, il, false, pos0, nt, false, &mut nb, &mut cur_a, &mut x_a)?;
+            self.prefill_layer(be, &d, m, il, il, false, pos0, nt, false, &mut nb, &mut cur_a, &mut x_a)?;
         }
-        {
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
-            let pf = self.pf.as_ref().unwrap();
-            let o = pf.buf.addr();
-            be.dtod(&pf.buf, (cur_a - o) as usize, &pf.buf, (pf.p.prelude - o) as usize, 4 * nt * n)?;
-        }
+        let o = pf.buf.addr();
+        be.dtod(&pf.buf, (cur_a - o) as usize, &pf.buf, (pf.p.prelude - o) as usize, 4 * nt * n)?;
         let n_pre = nb;
         for pass in 0..c.loop_count {
             let n_bank = nb.saturating_sub(n_pre + 1);
             if pass > 0 {
-                let d = dev::get().unwrap().lock().unwrap();
-                let be = &*d.parts[0].be;
-                let pf = self.pf.as_ref().unwrap();
-                let o = pf.buf.addr();
                 if n_bank > 0 {
                     be.dtod(&pf.buf, (pf.p.blocks - o) as usize + 4 * (n_pre + 1) * nt * n,
                             &pf.buf, (pf.p.bank - o) as usize, 4 * n_bank * nt * n)?;
@@ -838,26 +825,19 @@ impl Device {
             for ip in c.loop_start..c.loop_end {
                 let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
                 if pass > 0 {
-                    let d = dev::get().unwrap().lock().unwrap();
-                    let be = &*d.parts[0].be;
-                    let pf = self.pf.as_ref().unwrap();
                     be.ink_mix_n(pf.p.bank, n_bank, pf.p.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, pf.p.msg, n, nt)?;
                 }
-                if capture_dspark { self.record_dspark_visit(visit, cur_a, nt, n)?; }
+                if capture_dspark { self.record_dspark_visit(be, visit, cur_a, nt, n)?; }
                 visit += 1;
-                self.prefill_layer(m, il, ip, pass > 0, pos0, nt, false, &mut nb, &mut cur_a, &mut x_a)?;
+                self.prefill_layer(be, &d, m, il, ip, pass > 0, pos0, nt, false, &mut nb, &mut cur_a, &mut x_a)?;
             }
         }
         for il in c.loop_end..c.n_layer {
-            if capture_dspark { self.record_dspark_visit(visit, cur_a, nt, n)?; }
+            if capture_dspark { self.record_dspark_visit(be, visit, cur_a, nt, n)?; }
             visit += 1;
-            self.prefill_layer(m, il, il, false, pos0, nt, false, &mut nb, &mut cur_a, &mut x_a)?;
+            self.prefill_layer(be, &d, m, il, il, false, pos0, nt, false, &mut nb, &mut cur_a, &mut x_a)?;
         }
         let dspark_feats = if capture_dspark {
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
-            let pf = self.pf.as_ref().unwrap();
-            let o = pf.buf.addr();
             be.ink_mix_n(pf.p.blocks, nb, cur_a, self.out_query.addr(), 1, pf.p.h, n, nt)?;
             be.rms_norm(pf.p.h, n, self.out_norm.addr(), pf.p.hn, n, n, nt, c.eps)?;
             be.dtod(&pf.buf, (pf.p.hn - o) as usize, &pf.dspark_buf, 3 * 4 * nt * n, 4 * nt * n)?;
@@ -872,9 +852,6 @@ impl Device {
         };
         let logits = if want {
             let t = std::time::Instant::now();
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
-            let pf = self.pf.as_ref().unwrap();
             let (s, o) = (self.s, self.scr.addr());
             if !capture_dspark {
                 be.ink_mix_n(pf.p.blocks, nb, cur_a, self.out_query.addr(), 1, pf.p.h, n, nt)?;
@@ -935,40 +912,29 @@ impl Device {
             m.tok_embd.row_into(tok as usize, &mut emb);
             rms_norm_w(&emb, &m.tok_norm, c.eps, &mut cur_host[t * n..(t + 1) * n]);
         }
-        let (mut cur_a, mut x_a) = {
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
-            self.ensure_pf(be, c, m.output.rows, nt)?;
-            if !self.ahead { self.to_device(m, be, pos0)?; }
-            let pf = self.pf.as_ref().unwrap();
-            for (il, ds) in self.slots.iter().enumerate() {
-                be.dtod(&ds.hist, 0, &pf.hist_bak, il * 4 * h_total, 4 * h_total)?;
-            }
-            be.put(&cur_host, &pf.buf, 0)?;
-            (pf.p.cur, pf.p.x)
-        };
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        self.ensure_pf(be, c, m.output.rows, nt)?;
+        if !self.ahead { self.to_device(m, be, pos0)?; }
+        let pf = self.pf.as_ref().unwrap();
+        for (il, ds) in self.slots.iter().enumerate() {
+            be.dtod(&ds.hist, 0, &pf.hist_bak, il * 4 * h_total, 4 * h_total)?;
+        }
+        be.put(&cur_host, &pf.buf, 0)?;
+        let (mut cur_a, mut x_a) = (pf.p.cur, pf.p.x);
         let mut nb = 0usize;
         let mut visit = 0usize;
         for il in 0..c.loop_start {
-            if capture_dspark { self.record_dspark_visit(visit, cur_a, nt, n)?; }
+            if capture_dspark { self.record_dspark_visit(be, visit, cur_a, nt, n)?; }
             visit += 1;
-            self.prefill_layer(m, il, il, false, pos0, nt, true, &mut nb, &mut cur_a, &mut x_a)?;
+            self.prefill_layer(be, &d, m, il, il, false, pos0, nt, true, &mut nb, &mut cur_a, &mut x_a)?;
         }
-        {
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
-            let pf = self.pf.as_ref().unwrap();
-            let o = pf.buf.addr();
-            be.dtod(&pf.buf, (cur_a - o) as usize, &pf.buf, (pf.p.prelude - o) as usize, 4 * nt * n)?;
-        }
+        let o = pf.buf.addr();
+        be.dtod(&pf.buf, (cur_a - o) as usize, &pf.buf, (pf.p.prelude - o) as usize, 4 * nt * n)?;
         let n_pre = nb;
         for pass in 0..c.loop_count {
             let n_bank = nb.saturating_sub(n_pre + 1);
             if pass > 0 {
-                let d = dev::get().unwrap().lock().unwrap();
-                let be = &*d.parts[0].be;
-                let pf = self.pf.as_ref().unwrap();
-                let o = pf.buf.addr();
                 if n_bank > 0 {
                     be.dtod(&pf.buf, (pf.p.blocks - o) as usize + 4 * (n_pre + 1) * nt * n,
                             &pf.buf, (pf.p.bank - o) as usize, 4 * n_bank * nt * n)?;
@@ -980,27 +946,20 @@ impl Device {
             for ip in c.loop_start..c.loop_end {
                 let il = if pass == 0 { ip } else { c.n_layer + (pass - 1) * core + ip - c.loop_start };
                 if pass > 0 {
-                    let d = dev::get().unwrap().lock().unwrap();
-                    let be = &*d.parts[0].be;
-                    let pf = self.pf.as_ref().unwrap();
                     be.ink_mix_n(pf.p.bank, n_bank, pf.p.outb, self.loops[ip - c.loop_start].msg_query.addr(), 4, pf.p.msg, n, nt)?;
                 }
-                if capture_dspark { self.record_dspark_visit(visit, cur_a, nt, n)?; }
+                if capture_dspark { self.record_dspark_visit(be, visit, cur_a, nt, n)?; }
                 visit += 1;
-                self.prefill_layer(m, il, ip, pass > 0, pos0, nt, true, &mut nb, &mut cur_a, &mut x_a)?;
+                self.prefill_layer(be, &d, m, il, ip, pass > 0, pos0, nt, true, &mut nb, &mut cur_a, &mut x_a)?;
             }
         }
         for il in c.loop_end..c.n_layer {
-            if capture_dspark { self.record_dspark_visit(visit, cur_a, nt, n)?; }
+            if capture_dspark { self.record_dspark_visit(be, visit, cur_a, nt, n)?; }
             visit += 1;
-            self.prefill_layer(m, il, il, false, pos0, nt, true, &mut nb, &mut cur_a, &mut x_a)?;
+            self.prefill_layer(be, &d, m, il, il, false, pos0, nt, true, &mut nb, &mut cur_a, &mut x_a)?;
         }
         let (logits_all, argmax_all, dspark_feats) = {
             let t = std::time::Instant::now();
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
-            let pf = self.pf.as_ref().unwrap();
-            let o = pf.buf.addr();
             let out_w = d.tensor(m.output.gpu.unwrap());
             let vrows = m.output.rows;
             be.ink_mix_n(pf.p.blocks, nb, cur_a, self.out_query.addr(), 1, pf.p.h, n, nt)?;
@@ -1105,7 +1064,7 @@ impl Device {
     }
 
     fn prefill_layer(
-        &self, m: &Inkling2Model, il: usize, ip: usize, msgs: bool,
+        &self, be: &dyn Backend, d: &dev::Dev, m: &Inkling2Model, il: usize, ip: usize, msgs: bool,
         pos0: usize, nt: usize, verify_mode: bool, nb: &mut usize, cur_a: &mut u64, x_a: &mut u64,
     ) -> Result<()> {
         let (c, ml, l, ds, rank) = (&m.cfg, &m.layers[ip], &self.layers[ip], &self.slots[il], self.rank);
@@ -1119,8 +1078,6 @@ impl Device {
 
         let has_full_exps = {
             let t_prep = std::time::Instant::now();
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
             let w = |x: &Mat| d.tensor(x.gpu.unwrap());
             let small = Self::small(be, nt, verify_mode);
             let (mut ins, mut n_in) = (*cur_a, 1);
@@ -1395,15 +1352,10 @@ impl Device {
             }
         };
         if !has_full_exps {
-            let hn_flat: Vec<f32> = {
-                let d = dev::get().unwrap().lock().unwrap();
-                d.parts[0].be.get(&pf.buf, ((p.hn - buf_o) / 4) as usize, nt * n)?
-            };
+            let hn_flat: Vec<f32> = be.get(&pf.buf, ((p.hn - buf_o) / 4) as usize, nt * n)?;
             let hn_rows: Vec<Vec<f32>> = hn_flat.chunks_exact(n).map(|r| r.to_vec()).collect();
             let ys = m.ffn_batch(ip, &hn_rows);
             let y_flat: Vec<f32> = ys.into_iter().flatten().collect();
-            let d = dev::get().unwrap().lock().unwrap();
-            let be = &*d.parts[0].be;
             be.put(&y_flat, &pf.acc_buf, 0)?;
             if verify_mode {
                 be.dtod(&pf.acc_buf, 0, &pf.conv_log, log_base + 4 * VERIFY_MAX * (2 * kw + n), 4 * nt * n)?;
