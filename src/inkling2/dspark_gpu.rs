@@ -297,8 +297,7 @@ impl GpuDspark {
                     eps,
                 )?;
 
-                be.gemvq(&l.attn_k_ctx, self.scr_inj_ctx.addr(), n, 0, self.scr_inj_k.addr(), kw, cur_keep)?;
-                be.gemvq(&l.attn_v_ctx, self.scr_inj_ctx.addr(), n, 0, self.scr_inj_v.addr(), kw, cur_keep)?;
+                be.gemvq2(&l.attn_k_ctx, &l.attn_v_ctx, self.scr_inj_ctx.addr(), n, 0, self.scr_inj_k.addr(), self.scr_inj_v.addr(), cur_keep)?;
 
                 be.dspark_norm_rope(
                     self.scr_inj_k.addr(),
@@ -369,7 +368,7 @@ impl GpuDspark {
             return Ok(Vec::new());
         }
         let (bs, n, nh, nkv, hd, nf) = (self.block_size, self.n_embd, self.n_head, self.n_head_kv, self.head_dim, self.n_ff);
-        let (qd, kw) = (nh * hd, nkv * hd);
+        let (qd, _kw) = (nh * hd, nkv * hd);
         let scale = 1.0 / (hd as f32).sqrt();
         let eps = self.eps;
         let theta = self.rope_theta;
@@ -384,8 +383,7 @@ impl GpuDspark {
             be.rms_norm(self.scr_inp.addr(), n, l.attn_norm.addr(), self.scr_h.addr(), n, n, bs, eps)?;
 
             be.gemvq(&l.wq, self.scr_h.addr(), n, 0, self.scr_q.addr(), qd, bs)?;
-            be.gemvq(&l.wk, self.scr_h.addr(), n, 0, self.scr_k.addr(), kw, bs)?;
-            be.gemvq(&l.wv, self.scr_h.addr(), n, 0, self.scr_v.addr(), kw, bs)?;
+            be.gemvq2(&l.wk, &l.wv, self.scr_h.addr(), n, 0, self.scr_k.addr(), self.scr_v.addr(), bs)?;
 
             be.dspark_norm_rope(self.scr_q.addr(), l.attn_q_norm.addr(), self.scr_q.addr(), hd, nh, pos0, bs, eps, theta)?;
             be.dspark_norm_rope(self.scr_k.addr(), l.attn_k_norm.addr(), self.scr_k.addr(), hd, nkv, pos0, bs, eps, theta)?;
@@ -413,8 +411,7 @@ impl GpuDspark {
             be.add(self.scr_inp.addr(), self.scr_h.addr(), bs * n)?;
 
             be.rms_norm(self.scr_inp.addr(), n, l.ffn_norm.addr(), self.scr_h.addr(), n, n, bs, eps)?;
-            be.gemvq(&l.ffn_gate, self.scr_h.addr(), n, 0, self.scr_gu.addr(), nf, bs)?;
-            be.gemvq(&l.ffn_up, self.scr_h.addr(), n, 0, self.scr_gu.addr() + 4 * (bs * nf) as u64, nf, bs)?;
+            be.gemvq2(&l.ffn_gate, &l.ffn_up, self.scr_h.addr(), n, 0, self.scr_gu.addr(), self.scr_gu.addr() + 4 * (bs * nf) as u64, bs)?;
             be.swiglu(self.scr_gu.addr(), self.scr_gu.addr() + 4 * (bs * nf) as u64, bs * nf)?;
             be.gemvq(&l.ffn_down, self.scr_gu.addr(), nf, 0, self.scr_h.addr(), n, bs)?;
             be.add(self.scr_inp.addr(), self.scr_h.addr(), bs * n)?;

@@ -159,6 +159,8 @@ pub(super) struct Device {
     synced: usize,
     ahead: bool,
     pub dspark_gpu: Option<super::super::dspark_gpu::GpuDspark>,
+    verify_cur: std::cell::RefCell<Vec<f32>>,
+    verify_emb: std::cell::RefCell<Vec<f32>>,
 }
 
 fn up<T: crate::backend::Plain>(be: &dyn Backend, v: &[T]) -> Result<Buf> {
@@ -338,7 +340,12 @@ impl Device {
                 eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
             }
             let all_full = layers.iter().all(|l| l.full_exps.is_some());
-            let mut dev = Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, graph_keys: [0; 2], synced: 0, ahead: false, dspark_gpu: None };
+            let mut dev = Device {
+                layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full,
+                graph_keys: [0; 2], synced: 0, ahead: false, dspark_gpu: None,
+                verify_cur: std::cell::RefCell::new(Vec::with_capacity(VERIFY_MAX * c.n_embd)),
+                verify_emb: std::cell::RefCell::new(Vec::with_capacity(c.n_embd)),
+            };
             if let Some(ds) = &m.dspark {
                 if let Err(e) = dev.init_dspark(m.max_ctx, ds) {
                     eprintln!("inkling2: GPU DSpark init failed ({e:#}), will use CPU DSpark");
@@ -905,13 +912,6 @@ impl Device {
         let (n, core) = (c.n_embd, c.loop_end - c.loop_start);
         let h_total = hists(c).1;
         let t0 = std::time::Instant::now();
-        let mut cur_host = vec![0f32; nt * n];
-        let mut emb = vec![0f32; n];
-        for (t, &tok) in toks.iter().enumerate() {
-            ensure!((tok as usize) < m.tok_embd.rows, "token {tok} is outside the vocabulary");
-            m.tok_embd.row_into(tok as usize, &mut emb);
-            rms_norm_w(&emb, &m.tok_norm, c.eps, &mut cur_host[t * n..(t + 1) * n]);
-        }
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         self.ensure_pf(be, c, m.output.rows, nt)?;
@@ -920,7 +920,25 @@ impl Device {
         for (il, ds) in self.slots.iter().enumerate() {
             be.dtod(&ds.hist, 0, &pf.hist_bak, il * 4 * h_total, 4 * h_total)?;
         }
-        be.put(&cur_host, &pf.buf, 0)?;
+        {
+            let mut cur_guard = self.verify_cur.borrow_mut();
+            let cur_len = nt * n;
+            if cur_guard.len() < cur_len {
+                cur_guard.resize(cur_len, 0.0);
+            }
+            let cur_host = &mut cur_guard[..cur_len];
+            let mut emb_guard = self.verify_emb.borrow_mut();
+            if emb_guard.len() < n {
+                emb_guard.resize(n, 0.0);
+            }
+            let emb = &mut emb_guard[..n];
+            for (t, &tok) in toks.iter().enumerate() {
+                ensure!((tok as usize) < m.tok_embd.rows, "token {tok} is outside the vocabulary");
+                m.tok_embd.row_into(tok as usize, emb);
+                rms_norm_w(emb, &m.tok_norm, c.eps, &mut cur_host[t * n..(t + 1) * n]);
+            }
+            be.put(cur_host, &pf.buf, 0)?;
+        }
         let (mut cur_a, mut x_a) = (pf.p.cur, pf.p.x);
         let mut nb = 0usize;
         let mut visit = 0usize;
