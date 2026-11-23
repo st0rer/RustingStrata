@@ -24,7 +24,7 @@ echo Model: %MODEL%
 echo Draft: %DRAFT%
 echo ==============================================================================
 
-start /affinity 0xE /b /wait "%BIN%" bench ^
+start /affinity 0xE /b /wait "" "%BIN%" bench ^
   --model "%MODEL%" ^
   --draft-model "%DRAFT%" ^
   --spec-draft-n-max 3 ^

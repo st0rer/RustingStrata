@@ -583,7 +583,7 @@ impl Device {
                     self.layer_attn(be, &d, m, il, il, false, pos, true, &mut nb)?;
                     self.layer_ffn_gpu(be, m, il, il)?;
                 }
-                self.finish_logits(be, &d, m, nb)?;
+                self.finish_logits(be, &d, m, nb, !argmax)?;
                 if argmax {
                     be.argmax_rows(self.s.logits, c.n_vocab, 1, self.s.amax)?;
                 }
@@ -643,13 +643,13 @@ impl Device {
         nb
     }
 
-    fn finish_logits(&self, be: &dyn Backend, d: &dev::Dev, m: &Inkling2Model, nb: usize) -> Result<()> {
+    fn finish_logits(&self, be: &dyn Backend, d: &dev::Dev, m: &Inkling2Model, nb: usize, apply_softcap: bool) -> Result<()> {
         let (c, s) = (&m.cfg, self.s);
         let n = c.n_embd;
         be.ink_mix(s.blocks, nb, s.cur, self.out_query.addr(), 1, s.h, n)?;
         be.rms_norm_q(s.h, n, self.out_norm.addr(), s.hn, n, n, 1, c.eps, s.nrm_xq, 0)?;
         be.gemvq(d.tensor(m.output.gpu.unwrap()), s.hn, n, s.nrm_xq, s.logits, c.n_vocab, 1)?;
-        if c.softcap != 0.0 { be.softcap(s.logits, c.n_vocab, c.softcap)?; }
+        if apply_softcap && c.softcap != 0.0 { be.softcap(s.logits, c.n_vocab, c.softcap)?; }
         Ok(())
     }
 
@@ -670,7 +670,7 @@ impl Device {
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         let logits = (|| -> Result<Vec<f32>> {
-            self.finish_logits(be, &d, m, nb)?;
+            self.finish_logits(be, &d, m, nb, true)?;
             be.get(&self.scr, ((s.logits - o) / 4) as usize, c.n_vocab)
         })().expect("inkling2 device step");
         m.lap(7, t);
@@ -694,7 +694,7 @@ impl Device {
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         let next = (|| -> Result<u32> {
-            self.finish_logits(be, &d, m, nb)?;
+            self.finish_logits(be, &d, m, nb, false)?;
             be.argmax_rows(s.logits, c.n_vocab, 1, s.amax)?;
             Ok(be.get::<i32>(&self.scr, ((s.amax - o) / 4) as usize, 1)?[0] as u32)
         })().expect("inkling2 device step_argmax");
@@ -988,7 +988,7 @@ impl Device {
                 be.rms_norm(pf.p.h, n, self.out_norm.addr(), pf.p.hn, n, n, nt, c.eps)?;
                 be.gemm_dense(out_w, nt, pf.p.hn, n, pf.logits_buf.addr(), vrows, 0)?;
             }
-            if c.softcap != 0.0 {
+            if c.softcap != 0.0 && !argmax_only {
                 be.softcap(pf.logits_buf.addr(), nt * vrows, c.softcap)?;
             }
             let dspark = if capture_dspark {
@@ -1027,24 +1027,32 @@ impl Device {
         if let Some(ds_gpu) = &mut self.dspark_gpu {
             ds_gpu.inject_subset(be, pos0, keep, nt, pf.dspark_buf.addr())?;
         }
-        if keep >= nt { return Ok(()); }
         let c = &m.cfg;
         let (n, kw, hm) = (c.n_embd, c.n_head_kv * c.head_dim, c.n_conv - 1);
+        let rb = 2 * be.kv_words(kw);
+        // Commit the accepted SWA keys/values from swa_log into the ring buffers:
+        if keep > 0 {
+            for (il, ds) in self.slots.iter().enumerate() {
+                let ip = layer_of(c, il);
+                if m.layers[ip].swa {
+                    let swa_base = il * VERIFY_MAX * rb;
+                    let dst0 = pos0 % c.n_swa;
+                    let first = keep.min(c.n_swa - dst0);
+                    be.dtod(&pf.swa_kc_log, swa_base, &ds.k, dst0 * rb, first * rb)?;
+                    be.dtod(&pf.swa_vc_log, swa_base, &ds.v, dst0 * rb, first * rb)?;
+                    if first < keep {
+                        be.dtod(&pf.swa_kc_log, swa_base + first * rb, &ds.k, 0, (keep - first) * rb)?;
+                        be.dtod(&pf.swa_vc_log, swa_base + first * rb, &ds.v, 0, (keep - first) * rb)?;
+                    }
+                }
+            }
+        }
+        if keep >= nt { return Ok(()); }
         let (h_offs, h_total) = hists(c);
         let conv_widths = [kw, kw, n, n];
         let log_slot_bytes = 4 * VERIFY_MAX * (2 * kw + 2 * n);
         let log_offs = [0, 4 * VERIFY_MAX * kw, 4 * VERIFY_MAX * 2 * kw, 4 * VERIFY_MAX * (2 * kw + n)];
-        let rb = 2 * be.kv_words(kw);
         for (il, ds) in self.slots.iter().enumerate() {
-            let ip = layer_of(c, il);
-            if m.layers[ip].swa {
-                let swa_base = il * VERIFY_MAX * rb;
-                for t in (keep..nt).rev() {
-                    let at = (pos0 + t) % c.n_swa;
-                    be.dtod(&pf.swa_kc_log, swa_base + t * rb, &ds.k, at * rb, rb)?;
-                    be.dtod(&pf.swa_vc_log, swa_base + t * rb, &ds.v, at * rb, rb)?;
-                }
-            }
             let bak_base = il * 4 * h_total;
             let log_base = il * log_slot_bytes;
             for j in 0..4 {
@@ -1178,20 +1186,14 @@ impl Device {
                         pos0, nt, nh, nkv, hd, nr, c.rel_extent, ds.cap, 0
                     )?;
                 } else {
-                    for t in 0..nt {
-                        let pos = pos0 + t;
-                        let at = pos % c.n_swa;
-                        be.dtod(&ds.k, at * rb, &pf.swa_kc_log, swa_base + t * rb, rb)?;
-                        be.dtod(&ds.v, at * rb, &pf.swa_vc_log, swa_base + t * rb, rb)?;
-                        be.ink_clip_n(p.k2 + f(t * kw), 0, hd, nkv, 1, c.qk_clip, 0.0, 1.0, ds.k.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
-                        be.ink_clip_n(p.v2 + f(t * kw), 0, hd, nkv, 1, 0.0, c.eps, 1.0, ds.v.addr(), at, c.n_swa, 0, 0.0, 1.0)?;
-                        let rows = (pos + 1).min(c.n_swa);
-                        be.ink_attn(
-                            p.q + f(t * nh * hd), p.r + f(t * nh * nr), p.sink + f(t * nh), p.og + f(t * nh * hd),
-                            ds.k.addr(), ds.v.addr(), l.rel_bias.addr(), self.sc_buf.addr(), p.att + f(t * nh * hd),
-                            rows, at, nh, nkv, hd, nr, c.rel_extent,
-                        )?;
-                    }
+                    let kc_dst = pf.swa_kc_log.addr() + swa_base as u64;
+                    let vc_dst = pf.swa_vc_log.addr() + swa_base as u64;
+                    be.ink_clip_n(p.k2, 0, hd, nkv, nt, c.qk_clip, 0.0, 1.0, kc_dst, 0, nt, 0, 0.0, 1.0)?;
+                    be.ink_clip_n(p.v2, 0, hd, nkv, nt, 0.0, c.eps, 1.0, vc_dst, 0, nt, 0, 0.0, 1.0)?;
+                    be.ink_attn_prefill(
+                        p.q, p.r, p.sink, p.og, ds.k.addr(), ds.v.addr(), kc_dst, vc_dst, l.rel_bias.addr(), p.att,
+                        pos0, nt, nh, nkv, hd, nr, c.rel_extent, c.n_swa, c.n_swa
+                    )?;
                 }
             } else {
                 let (kd, vd, at0, kvr) = if ml.swa {
