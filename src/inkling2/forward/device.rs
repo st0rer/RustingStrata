@@ -1104,19 +1104,40 @@ impl Device {
                 }
             }
             let inp = |j: usize| p.nrm + f(j.min(n_n - 1) * nt * n);
-            let sx = crate::backend::SAME_X;
-            Self::proj_n(be, w(&ml.wq), small, nt, inp(0), norm_xq(0), p.q, 0)?;
-            Self::proj_n(be, w(&ml.gate), small, nt, inp(0), norm_xq(0), p.og, sx)?;
-            Self::proj_n(be, w(&ml.rel), small, nt, inp(0), norm_xq(0), p.r, sx)?;
-            Self::proj_n(be, w(&ml.sink), small, nt, inp(0), norm_xq(0), p.sink, sx)?;
-            let k_sx = if n_n == 1 { sx } else { 0 };
-            Self::proj_n(be, w(&ml.wk), small, nt, inp(1), norm_xq(1), p.k, k_sx)?;
-            if let Some([kp, _]) = &ml.conv_proj {
-                Self::proj_n(be, w(kp), small, nt, inp(1), norm_xq(1), p.kp, sx)?;
-            }
-            Self::proj_n(be, w(&ml.wv), small, nt, inp(2), norm_xq(2), p.v, k_sx)?;
-            if let Some([_, vp]) = &ml.conv_proj {
-                Self::proj_n(be, w(vp), small, nt, inp(2), norm_xq(2), p.vp, sx)?;
+            if small {
+                be.gemvq2(w(&ml.wq), w(&ml.gate), inp(0), n, norm_xq(0), p.q, p.og, nt)?;
+                be.gemvq(w(&ml.rel), inp(0), n, norm_xq(0), p.r, ml.rel.rows, nt)?;
+                be.gemvq(w(&ml.sink), inp(0), n, norm_xq(0), p.sink, ml.sink.rows, nt)?;
+                if n_n == 1 {
+                    be.gemvq2(w(&ml.wk), w(&ml.wv), inp(0), n, norm_xq(0), p.k, p.v, nt)?;
+                    if let Some([kp, vp]) = &ml.conv_proj {
+                        be.gemvq2(w(kp), w(vp), inp(0), n, norm_xq(0), p.kp, p.vp, nt)?;
+                    }
+                } else {
+                    be.gemvq(w(&ml.wk), inp(1), n, norm_xq(1), p.k, ml.wk.rows, nt)?;
+                    if let Some([kp, _]) = &ml.conv_proj {
+                        be.gemvq(w(kp), inp(1), n, norm_xq(1), p.kp, kp.rows, nt)?;
+                    }
+                    be.gemvq(w(&ml.wv), inp(2), n, norm_xq(2), p.v, ml.wv.rows, nt)?;
+                    if let Some([_, vp]) = &ml.conv_proj {
+                        be.gemvq(w(vp), inp(2), n, norm_xq(2), p.vp, vp.rows, nt)?;
+                    }
+                }
+            } else {
+                let sx = crate::backend::SAME_X;
+                Self::proj_n(be, w(&ml.wq), false, nt, inp(0), norm_xq(0), p.q, 0)?;
+                Self::proj_n(be, w(&ml.gate), false, nt, inp(0), norm_xq(0), p.og, sx)?;
+                Self::proj_n(be, w(&ml.rel), false, nt, inp(0), norm_xq(0), p.r, sx)?;
+                Self::proj_n(be, w(&ml.sink), false, nt, inp(0), norm_xq(0), p.sink, sx)?;
+                let k_sx = if n_n == 1 { sx } else { 0 };
+                Self::proj_n(be, w(&ml.wk), false, nt, inp(1), norm_xq(1), p.k, k_sx)?;
+                if let Some([kp, _]) = &ml.conv_proj {
+                    Self::proj_n(be, w(kp), false, nt, inp(1), norm_xq(1), p.kp, sx)?;
+                }
+                Self::proj_n(be, w(&ml.wv), false, nt, inp(2), norm_xq(2), p.v, k_sx)?;
+                if let Some([_, vp]) = &ml.conv_proj {
+                    Self::proj_n(be, w(vp), false, nt, inp(2), norm_xq(2), p.vp, sx)?;
+                }
             }
             if verify_mode {
                 be.dtod(&pf.buf, (p.k - buf_o) as usize, &pf.conv_log, log_base, 4 * nt * kw)?;
