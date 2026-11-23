@@ -11,9 +11,79 @@ __device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;
 __device__ __forceinline__ u32 ld16(const u8* p) { return *(const u16*)p; }  // 2-aligned only (every quant field is)
 __device__ __forceinline__ u32 ld32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
 __device__ __forceinline__ float ldh(const u8* p) { return h2f((u16)ld16(p)); }
-__device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
-__device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
-__device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+
+__device__ __forceinline__ u32 ldu32(const u8* p) { return *(const u32*)p; }
+__device__ __forceinline__ uint2 ldu64(const u8* p) { return *(const uint2*)p; }
+__device__ __forceinline__ uint4 ldu128(const u8* p) { return *(const uint4*)p; }
+
+// PTX cache-streaming loads (ld.global.cs): bypass / evict-first from L1 cache
+// to keep L1 clean for activations, attention and KV-cache.
+__device__ __forceinline__ u32 ldu32_cs(const u8* p) {
+    u32 v;
+    asm("ld.global.cs.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ uint2 ldu64_cs(const u8* p) {
+    uint2 v;
+    asm("ld.global.cs.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ uint4 ldu128_cs(const u8* p) {
+    uint4 v;
+    asm("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ void st_float4_cs(float4* p, float4 v) {
+    asm volatile("st.global.cs.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
+}
+__device__ __forceinline__ float4 ld_float4_cs(const float4* p) {
+    float4 v;
+    asm("ld.global.cs.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ u16 ld16_cs(const u8* p) {
+    u16 v;
+    asm("ld.global.cs.u16 %0, [%1];" : "=h"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ float ldh_cs(const u8* p) {
+    return h2f(ld16_cs(p));
+}
+__device__ __forceinline__ u8 ld8_cs(const u8* p) {
+    u32 v;
+    asm("ld.global.cs.u8 %0, [%1];" : "=r"(v) : "l"(p));
+    return (u8)v;
+}
+__device__ __forceinline__ signed char lds8_cs(const u8* p) {
+    int v;
+    asm("ld.global.cs.s8 %0, [%1];" : "=r"(v) : "l"(p));
+    return (signed char)v;
+}
+
+// PTX SFU hardware instructions (single-cycle throughput on Turing SM 75)
+__device__ __forceinline__ float fast_exp2(float x) {
+    float res;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(res) : "f"(x));
+    return res;
+}
+__device__ __forceinline__ float fast_exp(float x) {
+    return fast_exp2(x * 1.4426950408889634f);
+}
+__device__ __forceinline__ float fast_rcp(float x) {
+    float res;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(res) : "f"(x));
+    return res;
+}
+__device__ __forceinline__ float fast_rsqrt(float x) {
+    float res;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(res) : "f"(x));
+    return res;
+}
+__device__ __forceinline__ float fast_sigmoid(float x) { return fast_rcp(1.0f + fast_exp(-x)); }
+__device__ __forceinline__ float fast_silu(float x) { return x * fast_sigmoid(x); }
+__device__ __forceinline__ float silu(float x) { return fast_silu(x); }
+__device__ __forceinline__ float sigmoid(float x) { return fast_sigmoid(x); }
+__device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(fast_exp(x)); }
 
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
@@ -50,11 +120,11 @@ template <int T> __device__ void deq8(const u8* b, int sub, float* o);
 
 template <> __device__ __forceinline__ void deq8<0>(const u8* b, int sub, float* o) {  // F32
     const float4* f = (const float4*)b + 2 * sub;  // 16-byte loads: rows are 1024-byte multiples
-    float4 a = f[0], c = f[1];
+    float4 a = ld_float4_cs(f), c = ld_float4_cs(f + 1);
     o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w; o[4] = c.x; o[5] = c.y; o[6] = c.z; o[7] = c.w;
 }
 template <> __device__ __forceinline__ void deq8<30>(const u8* b, int sub, float* o) {  // BF16
-    uint4 q = *(const uint4*)(b + 16 * sub);  // one 16-byte load: rows are 16-byte multiples (cols % 8 == 0)
+    uint4 q = ldu128_cs(b + 16 * sub);  // one 16-byte load: rows are 16-byte multiples (cols % 8 == 0)
     u32 w[4] = {q.x, q.y, q.z, q.w};
     for (int i = 0; i < 4; i++) { o[2 * i] = __uint_as_float(w[i] << 16); o[2 * i + 1] = __uint_as_float(w[i] & 0xFFFF0000u); }
 }
@@ -343,7 +413,6 @@ __device__ __forceinline__ void gemv_row(const u8* __restrict__ w, const float* 
 // Activations are quantized per 32 elements to int8 in shared memory, and dot products use dp4a.
 
 __device__ __forceinline__ int pack4(int a, int b, int c, int d) { return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | (d << 24); }
-__device__ __forceinline__ u32 ldu32(const u8* p) { return *(const u32*)p; }  // 4-byte aligned only
 // kvalues_iq4nl of the 8 nibbles of q (llama.cpp's get_int_from_table_16): .x the low nibbles of its 4 bytes, .y
 // the high, in byte order. The table lives in 4 registers, so the lookups take no loads.
 __device__ __forceinline__ int2 lut16(u32 q, u32 t0, u32 t1, u32 t2, u32 t3) {
@@ -392,9 +461,9 @@ __device__ __forceinline__ void k4_dm_w(u32 dm, u32 w0, u32 w1, u32 w2, int j, f
 }
 template <bool WORDS>
 __device__ __forceinline__ void k4_dm(const u8* b, int j, float& d, float& m) {
-    u32 dm = ldu32(b); int s, mi;
+    u32 dm = ldu32_cs(b); int s, mi;
     if (WORDS) {
-        k4_dm_w(dm, ldu32(b + 4), ldu32(b + 8), ldu32(b + 12), j, d, m);
+        k4_dm_w(dm, ldu32_cs(b + 4), ldu32_cs(b + 8), ldu32_cs(b + 12), j, d, m);
         return;
     } else {
         scale_min_k4(j, b + 4, s, mi);
@@ -406,20 +475,20 @@ template <> struct QI<8> {  // Q8_0, 8 blocks of 34
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         const u8* p = b + 34 * (sub >> 2);
-        d = ldh(p);
+        d = ldh_cs(p);
         const u8* q = p + 2 + (sub & 3) * 8;  // 2-byte aligned
-        lo = (int)(ld16(q) | (ld16(q + 2) << 16)); hi = (int)(ld16(q + 4) | (ld16(q + 6) << 16));
+        lo = (int)(ld16_cs(q) | (ld16_cs(q + 2) << 16)); hi = (int)(ld16_cs(q + 4) | (ld16_cs(q + 6) << 16));
     }
 };
 template <> struct QI<10> {  // Q2_K (84 bytes: rows 4-aligned)
     static constexpr bool MIN = true;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, r2 = r & 31;
-        u8 s = b[n * 8 + j * 2 + (r2 >> 4)];
-        u32 dm = ldu32(b + 80);
+        u8 s = ld8_cs(b + n * 8 + j * 2 + (r2 >> 4));
+        u32 dm = ldu32_cs(b + 80);
         d = h2f((u16)dm) * (float)(s & 0xF); m = h2f((u16)(dm >> 16)) * (float)(s >> 4);
         const u8* q = b + 16 + 32 * n + r2;
-        lo = (int)((ldu32(q) >> (2 * j)) & 0x03030303u); hi = (int)((ldu32(q + 4) >> (2 * j)) & 0x03030303u);
+        lo = (int)((ldu32_cs(q) >> (2 * j)) & 0x03030303u); hi = (int)((ldu32_cs(q + 4) >> (2 * j)) & 0x03030303u);
     }
 };
 template <> struct QI<11> {  // Q3_K (110 bytes: rows 2-aligned)
@@ -427,9 +496,9 @@ template <> struct QI<11> {  // Q3_K (110 bytes: rows 2-aligned)
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         int e = sub * 8, n = e >> 7, r = e & 127, j = r >> 5, i0 = r & 31, is = n * 8 + j * 2 + (i0 >> 4);
         const u8* sc = b + 96;
-        int low = (sc[is & 7] >> (4 * (is >> 3))) & 0xF;
-        int hs = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
-        d = ldh(b + 108) * (float)((low | (hs << 4)) - 32);
+        int low = (ld8_cs(sc + (is & 7)) >> (4 * (is >> 3))) & 0xF;
+        int hs = (ld8_cs(sc + 8 + (is & 3)) >> (2 * (is >> 2))) & 3;
+        d = ldh_cs(b + 108) * (float)((low | (hs << 4)) - 32);
         const u8 *q = b + 32 + 32 * n + i0, *h = b + i0;
         uint2 Q = ld8a2(q), H = ld8a2(h);
         u32 q0 = Q.x, q1 = Q.y, h0 = H.x, h1 = H.y;
@@ -444,7 +513,7 @@ template <> struct QI<12> {  // Q4_K (144 bytes)
         int e = sub * 8, j = e >> 6, h = (e >> 5) & 1, l = e & 31;
         k4_dm<true>(b, 2 * j + h, d, m);
         const u8* q = b + 16 + 32 * j + l;
-        lo = (int)((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu); hi = (int)((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
+        lo = (int)((ldu32_cs(q) >> (4 * h)) & 0x0F0F0F0Fu); hi = (int)((ldu32_cs(q + 4) >> (4 * h)) & 0x0F0F0F0Fu);
     }
     // get(sub) and get(sub + 1) for an even sub with two 16-byte loads; b must be 16-byte aligned.
     __device__ static void get2(const u8* b, int sub, int& lo0, int& hi0, int& lo1, int& hi1, float& d, float& m) {
@@ -462,8 +531,8 @@ template <> struct QI<13> {  // Q5_K (176 bytes)
         k4_dm<false>(b, bit, d, m);
         const u8* qh = b + 16 + l;
         const u8* q = b + 48 + 32 * j + l;
-        lo = (int)(((ldu32(q) >> (4 * h)) & 0x0F0F0F0Fu) | (((ldu32(qh) >> bit) & 0x01010101u) << 4));
-        hi = (int)(((ldu32(q + 4) >> (4 * h)) & 0x0F0F0F0Fu) | (((ldu32(qh + 4) >> bit) & 0x01010101u) << 4));
+        lo = (int)(((ldu32_cs(q) >> (4 * h)) & 0x0F0F0F0Fu) | (((ldu32_cs(qh) >> bit) & 0x01010101u) << 4));
+        hi = (int)(((ldu32_cs(q + 4) >> (4 * h)) & 0x0F0F0F0Fu) | (((ldu32_cs(qh + 4) >> bit) & 0x01010101u) << 4));
     }
 };
 template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
@@ -472,7 +541,7 @@ template <> struct QI<14> {  // Q6_K (210 bytes: rows 2-aligned)
         int e = sub * 8, n = e >> 7, r = e & 127, qt = r >> 5, l = r & 31;
         const u8* ql = b + 64 * n + (qt & 1) * 32 + l;
         const u8* qh = b + 128 + 32 * n + l;
-        d = ldh(b + 208) * (float)((const signed char*)b)[192 + 8 * n + (l >> 4) + 2 * qt];
+        d = ldh_cs(b + 208) * (float)((const signed char*)b)[192 + 8 * n + (l >> 4) + 2 * qt];
         uint2 L = ld8a2(ql), H = ld8a2(qh);
         u32 l0 = L.x, l1 = L.y, h0 = H.x, h1 = H.y;
         int ns = 4 * (qt >> 1), hs = 2 * qt;
@@ -609,11 +678,12 @@ template <int T> struct QI40 {
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         const u8* p = b + (T == 2 ? 18 : 22) * (sub >> 2);
         int r = (sub & 3) * 8, sh = r < 16 ? 0 : 4;
-        d = ldh(p);
+        d = ldh_cs(p);
         const u8* q = p + (T == 2 ? 2 : 6) + (r & 15);
-        u32 a = ((ld16(q) | (ld16(q + 2) << 16)) >> sh) & 0x0F0F0F0Fu, c = ((ld16(q + 4) | (ld16(q + 6) << 16)) >> sh) & 0x0F0F0F0Fu;
+        uint2 qv = ld8a2(q);
+        u32 a = (qv.x >> sh) & 0x0F0F0F0Fu, c = (qv.y >> sh) & 0x0F0F0F0Fu;
         if (T == 6) {
-            u32 qh = (ld16(p + 2) | (ld16(p + 4) << 16)) >> r;
+            u32 qh = (ld16_cs(p + 2) | (ld16_cs(p + 4) << 16)) >> r;
             a |= (((qh & 15) * 0x00204081u) & 0x01010101u) << 4; c |= ((((qh >> 4) & 15) * 0x00204081u) & 0x01010101u) << 4;
         }
         u32 off = T == 2 ? 0x08080808u : 0x10101010u;
@@ -637,7 +707,8 @@ template <> struct QI<40> {  // NVFP4, 4 blocks of 36: 4 UE4M3 scales (one per 1
         int s = (sub & 7) >> 1;
         u32 sh = 4 * (sub & 1);
         d = ue4m3(p[s]);
-        lo = lut16h(ldu32(p + 4 + 8 * s), sh, FP4_T); hi = lut16h(ldu32(p + 8 + 8 * s), sh, FP4_T);
+        uint2 qv = ldu64_cs(p + 4 + 8 * s);
+        lo = lut16h(qv.x, sh, FP4_T); hi = lut16h(qv.y, sh, FP4_T);
     }
 };
 template <> __device__ __forceinline__ void deq8<40>(const u8* b, int sub, float* o) {
@@ -650,10 +721,11 @@ template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 onl
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
         const u8* p = b + 18 * (sub >> 2);
         int r = (sub & 3) * 8;
-        d = ldh(p);
+        d = ldh_cs(p);
         const u8* q = p + 2 + (r & 15);
         u32 sh = r < 16 ? 0 : 4;
-        lo = lut16h(ld16(q) | (ld16(q + 2) << 16), sh, IQ4NL_T); hi = lut16h(ld16(q + 4) | (ld16(q + 6) << 16), sh, IQ4NL_T);
+        uint2 qv = ld8a2(q);
+        lo = lut16h(qv.x, sh, IQ4NL_T); hi = lut16h(qv.y, sh, IQ4NL_T);
     }
 };
 
@@ -1588,7 +1660,7 @@ extern "C" __global__ void rms_norm(float* x, int x_stride, const float* w, floa
         }
         for (; i < n; i += 256) s += xr[i] * xr[i];
     }
-    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    float sc = fast_rsqrt(block_sum(s) / (float)n + eps);
     if (xq) {  // each thread scales, stores and quantizes its own 8 values, as quant_x would map them
         signed char* q = xq + (size_t)blockIdx.x * n;
         float* qd = (float*)(xq + (size_t)gridDim.x * n) + blockIdx.x * (n / 32);
@@ -1636,7 +1708,12 @@ __device__ void amax_reduce(float& b, int& bi, int n) {
 extern "C" __global__ void argmax_part(const float* x, int n, int2* part) {
     const float* xr = x + (size_t)blockIdx.y * n;
     float b = __int_as_float(0xff800000); int bi = n;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) if (xr[i] > b || bi == n) { b = xr[i]; bi = i; }
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int i = tid; i < n; i += stride) {
+        float v = xr[i];
+        if (v > b || bi == n) { b = v; bi = i; }
+    }
     amax_reduce(b, bi, n);
     if (threadIdx.x == 0) part[blockIdx.y * gridDim.x + blockIdx.x] = make_int2(__float_as_int(b), bi);
 }
@@ -1798,7 +1875,7 @@ extern "C" __global__ void ink_ctrl_gate(const u16* down, const float* cur, int 
     }
     a = block_sum(a); b = block_sum(b); sa = block_sum(sa); sb = block_sum(sb);
     if (threadIdx.x == 0)
-        gate[((size_t)tok * count + j) * rank + r] = a / sqrtf(sa / (float)n + 1e-6f) + b / sqrtf(sb / (float)n + 1e-6f);
+        gate[((size_t)tok * count + j) * rank + r] = a * fast_rsqrt(sa / (float)n + 1e-6f) + b * fast_rsqrt(sb / (float)n + 1e-6f);
 }
 
 // Loop controllers, the update across nt tokens: block (x, j, tok).
@@ -2115,7 +2192,7 @@ extern "C" __global__ void norm_gate(float* o, const float* w, const float* z, i
     const float* zh = z + (size_t)blockIdx.x * n;
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) s += h[i] * h[i];
-    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    float sc = fast_rsqrt(block_sum(s) / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) h[i] = h[i] * sc * w[i] * (sig ? sigmoid(zh[i]) : silu(zh[i]));
     if (!xq) return;
     __syncthreads();
@@ -2276,8 +2353,9 @@ __device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
         | (__shfl_xor_sync(0xffffffff, uq, 1) << 2)
         | (__shfl_xor_sync(0xffffffff, uq, 2) << 4)
         | (__shfl_xor_sync(0xffffffff, uq, 3) << 6);
-    int w = e % hd;
-    unsigned char* r = (unsigned char*)c + e / hd * (3 * hd / 8);
+    int w = (hd == 128) ? (int)(e & 127) : (int)(e % hd);
+    size_t row_idx = (hd == 128) ? (e >> 7) : (e / hd);
+    unsigned char* r = (unsigned char*)c + row_idx * (3 * hd / 8);
     if ((w & 3) == 0) r[w / 4] = (unsigned char)packed;
     if ((w & 31) == 0) {
         *(u16*)(r + hd / 4 + 2 * (w / 32)) = d_h;
@@ -2293,8 +2371,9 @@ __device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
     q = q < -7 ? -7 : (q > 7 ? 7 : q);
     unsigned nib = (unsigned)(q + 8);
     unsigned pair = nib | (__shfl_xor_sync(0xffffffff, nib, 1) << 4);
-    int w = e % hd;
-    unsigned char* r = (unsigned char*)c + e / hd * (hd / 2 + hd / 16);
+    int w = (hd == 128) ? (int)(e & 127) : (int)(e % hd);
+    size_t row_idx = (hd == 128) ? (e >> 7) : (e / hd);
+    unsigned char* r = (unsigned char*)c + row_idx * (hd / 2 + hd / 16);
     if ((w & 1) == 0) r[w / 2] = (unsigned char)pair;
     if ((w & 31) == 0) *(u16*)(r + hd / 2 + 2 * (w / 32)) = f2h(d);
 }
@@ -2302,9 +2381,11 @@ __device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
 // Quantize x into the cache at value offset e; the 32 lanes of the warp hold one 32-value block.
 __device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
     float d = warp_max(fabsf(x)) / 127.0f;
-    int w = e % hd;
-    char* r = (char*)c + e / hd * (hd + hd / 16);
-    r[w] = (signed char)(d == 0.0f ? 0.0f : roundf(x / d));
+    float id = d == 0.0f ? 0.0f : 1.0f / d;
+    int w = (hd == 128) ? (int)(e & 127) : (int)(e % hd);
+    size_t row_idx = (hd == 128) ? (e >> 7) : (e / hd);
+    char* r = (char*)c + row_idx * (hd + hd / 16);
+    r[w] = (signed char)roundf(x * id);
     if ((w & 31) == 0) *(u16*)(r + hd + 2 * (w / 32)) = f2h(d);
 }
 #else
@@ -2340,7 +2421,7 @@ extern "C" __global__ void rms_norm_rope(const float* x, int x_stride, const flo
     float* o = out + (size_t)b * n;
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += 256) s += xr[i] * xr[i];
-    float sc = 1.0f / sqrtf(block_sum(s) / (float)n + eps);
+    float sc = fast_rsqrt(block_sum(s) / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += 256) o[i] = xr[i] * sc * w[i];
     __syncthreads();
     int i = threadIdx.x, half = n_rot / 2;
@@ -2379,8 +2460,9 @@ template <int PER> __device__ __forceinline__ void ldh_raw(const u16* p, unsigne
 // PER consecutive cache values from value offset off (off a multiple of PER, PER <= 32) as f16 words, like ldh_raw.
 template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off, int hd, unsigned* o) {
 #if KV_MODE == 3
-    int w = off % hd;
-    const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
+    int w = (hd == 128) ? (int)(off & 127) : (int)(off % hd);
+    size_t row_idx = (hd == 128) ? (off >> 7) : (off / hd);
+    const unsigned char* r = (const unsigned char*)c + row_idx * (3 * hd / 8);
     float d = h2f(*(const u16*)(r + hd / 4 + 2 * (w / 32)));
     float mn = h2f(*(const u16*)(r + hd / 4 + hd / 16 + 2 * (w / 32)));
     for (int i = 0; i < PER / 2; i++) {
@@ -2391,8 +2473,9 @@ template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off
         o[i] = (unsigned)f2h(fmaf((float)q0, d, mn)) | ((unsigned)f2h(fmaf((float)q1, d, mn)) << 16);
     }
 #elif KV_MODE == 2
-    int w = off % hd;
-    const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+    int w = (hd == 128) ? (int)(off & 127) : (int)(off % hd);
+    size_t row_idx = (hd == 128) ? (off >> 7) : (off / hd);
+    const unsigned char* r = (const unsigned char*)c + row_idx * (hd / 2 + hd / 16);
     float d = h2f(*(const u16*)(r + hd / 2 + 2 * (w / 32)));
     for (int i = 0; i < PER / 2; i++) {
         unsigned b = r[w / 2 + i];
@@ -2400,8 +2483,9 @@ template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off
         o[i] = (unsigned)f2h((float)q0 * d) | ((unsigned)f2h((float)q1 * d) << 16);
     }
 #elif KV_MODE == 1
-    int w = off % hd;
-    const char* r = (const char*)c + off / hd * (hd + hd / 16);
+    int w = (hd == 128) ? (int)(off & 127) : (int)(off % hd);
+    size_t row_idx = (hd == 128) ? (off >> 7) : (off / hd);
+    const char* r = (const char*)c + row_idx * (hd + hd / 16);
     unsigned d = *(const u16*)(r + hd + 2 * (w / 32)) * 0x10001u;  // scale in both halves
     // Byte q (flipped to q + 128) under exponent byte 0x64 is the f16 1024 + q + 128; minus 1152 gives q exactly, and
     // q * d rounded once to f16 equals f2h((float)q * d).
@@ -2461,23 +2545,26 @@ __device__ __forceinline__ float rh(float x) { return h2f(f2h(x)); }
 // Scalar KV element load matching GLSL ldkv().
 __device__ __forceinline__ float ldkv1(const u16* c, size_t off, int hd) {
 #if KV_MODE == 3
-    int w = off % hd;
-    const unsigned char* r = (const unsigned char*)c + off / hd * (3 * hd / 8);
+    int w = (hd == 128) ? (int)(off & 127) : (int)(off % hd);
+    size_t row_idx = (hd == 128) ? (off >> 7) : (off / hd);
+    const unsigned char* r = (const unsigned char*)c + row_idx * (3 * hd / 8);
     unsigned b = r[w / 4];
     float d = h2f(*(const u16*)(r + hd / 4 + 2 * (w / 32)));
     float mn = h2f(*(const u16*)(r + hd / 4 + hd / 16 + 2 * (w / 32)));
     int q = (b >> (2 * (w & 3))) & 3;
     return rh(fmaf((float)q, d, mn));
 #elif KV_MODE == 2
-    int w = off % hd;
-    const unsigned char* r = (const unsigned char*)c + off / hd * (hd / 2 + hd / 16);
+    int w = (hd == 128) ? (int)(off & 127) : (int)(off % hd);
+    size_t row_idx = (hd == 128) ? (off >> 7) : (off / hd);
+    const unsigned char* r = (const unsigned char*)c + row_idx * (hd / 2 + hd / 16);
     unsigned b = r[w / 2];
     float d = h2f(*(const u16*)(r + hd / 2 + 2 * (w / 32)));
     int q = (int)((w & 1) == 0 ? (b & 15u) : (b >> 4)) - 8;
     return rh((float)q * d);
 #elif KV_MODE == 1
-    int w = off % hd;
-    const signed char* r = (const signed char*)c + off / hd * (hd + hd / 16);
+    int w = (hd == 128) ? (int)(off & 127) : (int)(off % hd);
+    size_t row_idx = (hd == 128) ? (off >> 7) : (off / hd);
+    const signed char* r = (const signed char*)c + row_idx * (hd + hd / 16);
     float d = h2f(*(const u16*)(r + hd + 2 * (w / 32)));
     return rh((float)r[w] * d);
 #else
@@ -2521,7 +2608,7 @@ extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float t
     int eff_dst_at0 = pos_ptr ? (eff_pos0 % dst_ring) : dst_at0;
     float eff_mul = mul;
     if (log_alpha != 0.f) eff_mul *= 1.f + log_alpha * logf(fmaxf((float)(eff_pos0 + tok + 1) / log_floor, 1.f));
-    float f = (thr > 0.f ? fminf(thr / (sqrtf(ss) + 1e-6f), 1.f) : 1.f / sqrtf(ss / (float)w + eps)) * eff_mul;
+    float f = (thr > 0.f ? fminf(thr * fast_rsqrt(ss + 1e-6f * 1e-6f), 1.f) : fast_rsqrt(ss / (float)w + eps)) * eff_mul;
     if (t < w) {
         v *= f;
         x[at] = v;
@@ -2537,7 +2624,7 @@ extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float t
 extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
                                     const float* bias, float* sc, int rows, int at, int ring, int nkv, int hd, int nr, int ext, const int* pos_ptr) {
     __shared__ float qs[128], ps[64], acc[128];
-    int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * hd, t = threadIdx.x, lane = t & 31;
+    int h = blockIdx.x, kh = h / (gridDim.x / nkv), t = threadIdx.x, lane = t & 31;
     if (pos_ptr) {
         int pos = *pos_ptr;
         rows = min(pos + 1, ring);
@@ -2546,7 +2633,7 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     int i0 = blockIdx.y * 64, n = i0 < rows ? min(64, rows - i0) : 0;
     if (t < hd) qs[t] = q[h * hd + t];
     __syncthreads();
-    float scale = 1.f / sqrtf((float)hd);
+    float scale = fast_rsqrt((float)hd);
     for (int j = t >> 5; j < n; j += 4) {
         int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
         size_t row_idx = (size_t)i * (size_t)nkv + (size_t)kh;
@@ -2561,11 +2648,13 @@ extern "C" __global__ void ink_attn(const float* q, const float* r, const float*
     float mx = -3.0e38f;
     for (int j = 0; j < n; j++) mx = fmaxf(mx, ps[j]);
     __syncthreads();
-    if (t < n) ps[t] = expf(ps[t] - mx);
+    if (t < n) ps[t] = fast_exp(ps[t] - mx);
     __syncthreads();
-    int c = t % hd, parts = 128 / hd;
+    int c = (hd == 128) ? t : (t % hd);
+    int parts = (hd == 128) ? 1 : (128 / hd);
+    int j_start = (hd == 128) ? 0 : (t / hd);
     float a = 0.f;
-    for (int j = t / hd; j < n; j += parts) a += ps[j] * ldkv_row(v, (size_t)(i0 + j) * (size_t)nkv + (size_t)kh, c, hd);
+    for (int j = j_start; j < n; j += parts) a += ps[j] * ldkv_row(v, (size_t)(i0 + j) * (size_t)nkv + (size_t)kh, c, hd);
     acc[t] = a;
     __syncthreads();
     float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
@@ -2587,13 +2676,13 @@ extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, fl
     const float* p = sc + (size_t)h * chunks * (hd + 2);
     float mx = 0.f;
     for (int j = 0; j < chunks; j++) mx = fmaxf(mx, p[j * (hd + 2)]);
-    float z = expf(-mx), o = 0.f;
+    float z = fast_exp(-mx), o = 0.f;
     for (int j = 0; j < chunks; j++) {
-        float e = expf(p[j * (hd + 2)] - mx);
+        float e = fast_exp(p[j * (hd + 2)] - mx);
         z += p[j * (hd + 2) + 1] * e;
         if (t < hd) o += p[j * (hd + 2) + 2 + t] * e;
     }
-    if (t < hd) out[h * hd + t] = o / z * sigmoid(gate[h * hd + t]);
+    if (t < hd) out[h * hd + t] = o * fast_rcp(z) * fast_sigmoid(gate[h * hd + t]);
 }
 
 // Inkling 2 causal prefill attention with online softmax + virtual sink logit 0.
@@ -2605,10 +2694,10 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
     int t = blockIdx.x * 4 + (threadIdx.x >> 5), h = blockIdx.y, lane = threadIdx.x & 31;
     if (t >= nt) return;
     constexpr int HD = 32 * PER;
-    int kh = h / (nh / nkv), kw = nkv * HD;
+    int kh = h / (nh / nkv);
     int q_pos = pos + t;
     int start = (win > 0 && q_pos + 1 > win) ? (q_pos + 1 - win) : 0;
-    float scale = 1.f / sqrtf((float)HD);
+    float scale = fast_rsqrt((float)HD);
     float qv[PER], acc[PER];
     for (int j = 0; j < PER; j++) {
         qv[j] = q[((size_t)t * nh + h) * HD + lane + 32 * j] * scale;
@@ -2637,16 +2726,16 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
             b = warp_sum(b);
         }
         float logit = s + b - sink_val;
-        float mn = fmaxf(m, logit), c = expf(m - mn), e = expf(logit - mn);
+        float mn = fmaxf(m, logit), c = fast_exp(m - mn), e = fast_exp(logit - mn);
         l = l * c + e;
         for (int j = 0; j < PER; j++) acc[j] = e * ldkv_row(vbuf, row_idx, lane + 32 * j, HD) + acc[j] * c;
         m = mn;
     }
-    float inv = 1.f / l;
+    float inv = fast_rcp(l);
     for (int j = 0; j < PER; j++) {
         int col = lane + 32 * j;
         size_t idx = ((size_t)t * nh + h) * HD + col;
-        outp[idx] = acc[j] * inv * sigmoid(gate[idx]);
+        outp[idx] = acc[j] * inv * fast_sigmoid(gate[idx]);
     }
 }
 #define DEF_INK_PREFILL(HD) \
@@ -3764,7 +3853,7 @@ extern "C" __global__ void dspark_norm_rope(
 
     float v_sq = v * v;
     float sum_sq = block_sum(v_sq);
-    float rms = rsqrtf(sum_sq / (float)hd + eps);
+    float rms = fast_rsqrt(sum_sq / (float)hd + eps);
     float v_norm = v * rms * norm_w[d];
 
     __shared__ float sh_v[128];
@@ -3773,10 +3862,10 @@ extern "C" __global__ void dspark_norm_rope(
 
     int half = hd / 2; // 64
     if (d < half) {
-        float freq = powf(theta, -((float)(2 * d) / (float)hd));
+        float freq = fast_exp2(-((float)(2 * d) / (float)hd) * logf(theta) * 1.4426950408889634f);
         float angle = (float)pos * freq;
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
+        float sin_a, cos_a;
+        __sincosf(angle, &sin_a, &cos_a);
         float x0 = sh_v[d];
         float x1 = sh_v[d + half];
         out[off + d] = x0 * cos_a - x1 * sin_a;
@@ -3846,15 +3935,15 @@ extern "C" __global__ void dspark_attn(
 
         // Online softmax update
         float m_new = fmaxf(m, score);
-        float p = expf(score - m_new);
-        float factor = expf(m - m_new);
+        float p = fast_exp(score - m_new);
+        float factor = fast_exp(m - m_new);
         l = l * factor + p;
         acc = acc * factor + p * v_val;
         m = m_new;
         __syncthreads();
     }
 
-    out[((size_t)i * nh + h) * hd + d] = acc / (l + 1e-10f);
+    out[((size_t)i * nh + h) * hd + d] = acc * fast_rcp(l + 1e-10f);
 }
 
 extern "C" __global__ void dspark_markov_prep(

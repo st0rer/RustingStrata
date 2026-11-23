@@ -139,7 +139,7 @@ impl Tune {
     fn from_env() -> Tune {
         let gemm_bk = tuned(std::env::var("STRATA_GEMM_BK").ok().as_deref(), GEMM_BK, |v| v > 0 && v % 8 == 0);
         let gemm_min_blocks = tuned(std::env::var("STRATA_GEMM_MIN_BLOCKS").ok().as_deref(), 1, |v| (1..=8).contains(&v));
-        let gemv_loadw = tuned(std::env::var("STRATA_GEMV_LOADW").ok().as_deref(), 0, |v| v <= 1);
+        let gemv_loadw = tuned(std::env::var("STRATA_GEMV_LOADW").ok().as_deref(), 1, |v| v <= 1);
         Tune { gemm_bk, gemm_min_blocks, gemv_loadw }
     }
 }
