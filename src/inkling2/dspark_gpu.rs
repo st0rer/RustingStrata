@@ -357,7 +357,7 @@ impl GpuDspark {
         target_output: &GpuTensor,
         s_logits: u64,
         n_vocab: usize,
-        softcap: f32,
+        _softcap: f32,
         anchor_emb: &[f32],
         anchor_tok: u32,
         pos0: usize,
@@ -420,48 +420,50 @@ impl GpuDspark {
         // 3. Output RMS norm -> scr_hidden
         be.rms_norm(self.scr_inp.addr(), n, self.output_norm.addr(), self.scr_hidden.addr(), n, n, bs, eps)?;
 
-        // 4. Chained Markov RNN Head (100% Async on GPU, zero PCIe host round trips per step)
+        // 4. Chained Markov RNN Head (Captured in CUDA Graph, 100% Async on GPU, zero PCIe host round trips per step)
         be.memset(&self.scr_state)?;
         let anchor_bytes = anchor_tok.to_le_bytes();
         be.put(&anchor_bytes, &self.scr_out_tok, 0)?;
 
         let rank = self.rank;
 
-        for step in 0..count {
-            let h_row_addr = self.scr_hidden.addr() + 4 * ((step + 1) * n) as u64;
-            let prev_tok_ptr = self.scr_out_tok.addr() + 4 * step as u64;
-            let next_tok_ptr = self.scr_out_tok.addr() + 4 * (step + 1) as u64;
+        let markov_key = 0x4453_504B_0000_0000u64 | (count as u64);
+        be.graph(markov_key, &mut || {
+            for step in 0..count {
+                let h_row_addr = self.scr_hidden.addr() + 4 * ((step + 1) * n) as u64;
+                let prev_tok_ptr = self.scr_out_tok.addr() + 4 * step as u64;
+                let next_tok_ptr = self.scr_out_tok.addr() + 4 * (step + 1) as u64;
 
-            be.dspark_markov_prep(
-                prev_tok_ptr,
-                self.markov_w1.addr(),
-                self.scr_state.addr(),
-                h_row_addr,
-                self.ctx_last.addr(),
-                self.scr_joint_in.addr(),
-                n,
-                rank,
-            )?;
+                be.dspark_markov_prep(
+                    prev_tok_ptr,
+                    self.markov_w1.addr(),
+                    self.scr_state.addr(),
+                    h_row_addr,
+                    self.ctx_last.addr(),
+                    self.scr_joint_in.addr(),
+                    n,
+                    rank,
+                )?;
 
-            be.gemvq(&self.joint_proj, self.scr_joint_in.addr(), 5120, 0, self.scr_joint.addr(), 768, 1)?;
+                be.gemvq(&self.joint_proj, self.scr_joint_in.addr(), 5120, 0, self.scr_joint.addr(), 768, 1)?;
 
-            be.dspark_markov_step(
-                self.scr_joint.addr(),
-                self.joint_proj_b.addr(),
-                self.scr_state.addr(),
-                self.scr_latent.addr(),
-                rank,
-            )?;
+                be.dspark_markov_step(
+                    self.scr_joint.addr(),
+                    self.joint_proj_b.addr(),
+                    self.scr_state.addr(),
+                    self.scr_latent.addr(),
+                    rank,
+                )?;
 
-            be.gemvq(&self.hidden_out, self.scr_latent.addr(), 256, 0, self.scr_corr.addr(), n, 1)?;
-            be.dspark_hidden_corr(self.scr_corr.addr(), self.hidden_out_b.addr(), h_row_addr, n)?;
+                be.gemvq(&self.hidden_out, self.scr_latent.addr(), 256, 0, self.scr_corr.addr(), n, 1)?;
+                be.dspark_hidden_corr(self.scr_corr.addr(), self.hidden_out_b.addr(), h_row_addr, n)?;
 
-            be.gemvq(target_output, self.scr_corr.addr(), n, 0, s_logits, n_vocab, 1)?;
-            if softcap != 0.0 {
-                be.softcap(s_logits, n_vocab, softcap)?;
+                be.gemvq(target_output, self.scr_corr.addr(), n, 0, s_logits, n_vocab, 1)?;
+                // softcap is strictly monotonic, so argmax_rows yields the exact same token without running tanh over 201K floats
+                be.argmax_rows(s_logits, n_vocab, 1, next_tok_ptr)?;
             }
-            be.argmax_rows(s_logits, n_vocab, 1, next_tok_ptr)?;
-        }
+            Ok(())
+        })?;
 
         // Single contiguous DtoH copy of all generated draft tokens at the end
         let mut drafts_bytes = vec![0u8; count * 4];

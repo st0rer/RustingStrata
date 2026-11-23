@@ -41,6 +41,11 @@ __device__ __forceinline__ float4 ld_float4_cs(const float4* p) {
     asm("ld.global.cs.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p));
     return v;
 }
+__device__ __forceinline__ float ld_f32_cs(const float* p) {
+    float v;
+    asm("ld.global.cs.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    return v;
+}
 __device__ __forceinline__ u16 ld16_cs(const u8* p) {
     u16 v;
     asm("ld.global.cs.u16 %0, [%1];" : "=h"(v) : "l"(p));
@@ -1710,7 +1715,18 @@ extern "C" __global__ void argmax_part(const float* x, int n, int2* part) {
     float b = __int_as_float(0xff800000); int bi = n;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
-    for (int i = tid; i < n; i += stride) {
+    int i = tid;
+    for (; i + 3 * stride < n; i += 4 * stride) {
+        float v0 = xr[i];
+        float v1 = xr[i + stride];
+        float v2 = xr[i + 2 * stride];
+        float v3 = xr[i + 3 * stride];
+        if (v0 > b || bi == n) { b = v0; bi = i; }
+        if (v1 > b) { b = v1; bi = i + stride; }
+        if (v2 > b) { b = v2; bi = i + 2 * stride; }
+        if (v3 > b) { b = v3; bi = i + 3 * stride; }
+    }
+    for (; i < n; i += stride) {
         float v = xr[i];
         if (v > b || bi == n) { b = v; bi = i; }
     }
@@ -2706,11 +2722,35 @@ __device__ void ink_attn_prefill_t(const float* q, const float* r, const float* 
     float sink_val = sink[(size_t)t * nh + h];
     float r_reg = (nr <= 32 && lane < nr) ? r[((size_t)t * nh + h) * nr + lane] : 0.f;
     float m = 0.f, l = 1.f;
-    for (int kp = start; kp <= q_pos; kp++) {
+    int ring_mask = ring - 1;
+    bool ring_pow2 = (ring > 0) && ((ring & ring_mask) == 0);
+    int ext_boundary = q_pos - ext + 1;
+    int mid = start > ext_boundary ? start : ext_boundary;
+
+    // 1. Far tokens: dist >= ext, so relative bias b == 0.0f identically (saves warp_sum and bias memory lookups)
+    for (int kp = start; kp < mid; kp++) {
         bool use_new = kc_new && kp >= pos;
         const u16* kbuf = use_new ? kc_new : kc;
         const u16* vbuf = use_new ? vc_new : vc;
-        size_t row = use_new ? (size_t)(kp - pos) : (win > 0 ? (size_t)(kp % ring) : (size_t)kp);
+        size_t row = use_new ? (size_t)(kp - pos) : (win > 0 ? (size_t)(ring_pow2 ? (kp & ring_mask) : (kp % ring)) : (size_t)kp);
+        size_t row_idx = row * (size_t)nkv + (size_t)kh;
+        float s = 0.f;
+        for (int j = 0; j < PER; j++) s += qv[j] * ldkv_row(kbuf, row_idx, lane + 32 * j, HD);
+        s = warp_sum(s);
+
+        float logit = s - sink_val;
+        float mn = fmaxf(m, logit), c = fast_exp(m - mn), e = fast_exp(logit - mn);
+        l = l * c + e;
+        for (int j = 0; j < PER; j++) acc[j] = e * ldkv_row(vbuf, row_idx, lane + 32 * j, HD) + acc[j] * c;
+        m = mn;
+    }
+
+    // 2. Near tokens: dist < ext, relative position bias applied
+    for (int kp = mid; kp <= q_pos; kp++) {
+        bool use_new = kc_new && kp >= pos;
+        const u16* kbuf = use_new ? kc_new : kc;
+        const u16* vbuf = use_new ? vc_new : vc;
+        size_t row = use_new ? (size_t)(kp - pos) : (win > 0 ? (size_t)(ring_pow2 ? (kp & ring_mask) : (kp % ring)) : (size_t)kp);
         size_t row_idx = row * (size_t)nkv + (size_t)kh;
         float s = 0.f;
         for (int j = 0; j < PER; j++) s += qv[j] * ldkv_row(kbuf, row_idx, lane + 32 * j, HD);
@@ -3860,9 +3900,9 @@ extern "C" __global__ void dspark_norm_rope(
     sh_v[d] = v_norm;
     __syncthreads();
 
-    int half = hd / 2; // 64
+    int half = hd >> 1; // 64
     if (d < half) {
-        float freq = fast_exp2(-((float)(2 * d) / (float)hd) * logf(theta) * 1.4426950408889634f);
+        float freq = fast_exp2(-((float)(2 * d) / (float)hd) * log2f(theta));
         float angle = (float)pos * freq;
         float sin_a, cos_a;
         __sincosf(angle, &sin_a, &cos_a);
@@ -3900,7 +3940,7 @@ extern "C" __global__ void dspark_attn(
 
     float q_val = q[((size_t)i * nh + h) * hd + d];
 
-    __shared__ float s_red[32];
+    __shared__ float s_red[2][4];
     int lane = d & 31;
     int warp = d >> 5;
 
@@ -3908,30 +3948,24 @@ extern "C" __global__ void dspark_attn(
     float l = 0.0f;
     float acc = 0.0f;
 
-    int n_tot = n_ctx + bs;
-    for (int s = 0; s < n_tot; s++) {
-        float k_val, v_val;
-        if (s < n_ctx) {
-            int slot = (first + s) % ring;
-            k_val = kc[(size_t)slot * kw + kh * hd + d];
-            v_val = vc[(size_t)slot * kw + kh * hd + d];
-        } else {
-            int b = s - n_ctx;
-            k_val = k_blk[(size_t)b * kw + kh * hd + d];
-            v_val = v_blk[(size_t)b * kw + kh * hd + d];
-        }
+    int ring_mask = ring - 1;
+    bool pow2 = (ring > 0) && ((ring & ring_mask) == 0);
+    size_t kh_off = (size_t)kh * hd + d;
+
+    // 1. Context tokens from ring cache
+    for (int s = 0; s < n_ctx; s++) {
+        int slot = pow2 ? ((first + s) & ring_mask) : ((first + s) % ring);
+        size_t off = (size_t)slot * kw + kh_off;
+        float k_val = ld_f32_cs(kc + off);
+        float v_val = ld_f32_cs(vc + off);
 
         float prod = q_val * k_val;
         prod = warp_sum(prod);
-        if (lane == 0) s_red[warp] = prod;
+        int buf_idx = s & 1;
+        if (lane == 0) s_red[buf_idx][warp] = prod;
         __syncthreads();
 
-        if (d == 0) {
-            float total = s_red[0] + s_red[1] + s_red[2] + s_red[3];
-            s_red[0] = total * scale;
-        }
-        __syncthreads();
-        float score = s_red[0];
+        float score = (s_red[buf_idx][0] + s_red[buf_idx][1] + s_red[buf_idx][2] + s_red[buf_idx][3]) * scale;
 
         // Online softmax update
         float m_new = fmaxf(m, score);
@@ -3940,7 +3974,29 @@ extern "C" __global__ void dspark_attn(
         l = l * factor + p;
         acc = acc * factor + p * v_val;
         m = m_new;
+    }
+
+    // 2. Draft block tokens
+    for (int b = 0; b < bs; b++) {
+        size_t off = (size_t)b * kw + kh_off;
+        float k_val = k_blk[off];
+        float v_val = v_blk[off];
+
+        float prod = q_val * k_val;
+        prod = warp_sum(prod);
+        int buf_idx = (n_ctx + b) & 1;
+        if (lane == 0) s_red[buf_idx][warp] = prod;
         __syncthreads();
+
+        float score = (s_red[buf_idx][0] + s_red[buf_idx][1] + s_red[buf_idx][2] + s_red[buf_idx][3]) * scale;
+
+        // Online softmax update
+        float m_new = fmaxf(m, score);
+        float p = fast_exp(score - m_new);
+        float factor = fast_exp(m - m_new);
+        l = l * factor + p;
+        acc = acc * factor + p * v_val;
+        m = m_new;
     }
 
     out[((size_t)i * nh + h) * hd + d] = acc * fast_rcp(l + 1e-10f);
@@ -4012,7 +4068,7 @@ extern "C" __global__ void dspark_kv_store(
 ) {
     int t = blockIdx.x;      // token 0..keep-1
     if (t >= keep) return;
-    int slot = (pos0 + t) % ring;
+    int slot = ((ring & (ring - 1)) == 0) ? ((pos0 + t) & (ring - 1)) : ((pos0 + t) % ring);
     for (int j = threadIdx.x; j < kw; j += blockDim.x) {
         k_cache[(size_t)slot * kw + j] = k_new[(size_t)t * kw + j];
         v_cache[(size_t)slot * kw + j] = v_new[(size_t)t * kw + j];
